@@ -540,9 +540,13 @@ function start(): void {
         ['broken', 'Check artifact', count('broken')],
         ['ok', 'OK', count('ok')],
       ];
-      // A filter with nothing in it falls back to showing everything.
-      const active = filters.find(([f, , n]) => f === state.filter && n)?.[0] ?? 'all';
-      for (const [filter, label, n] of filters) {
+      // Filters only help when there is something to tell apart: with a single
+      // status present they would just repeat "All". A filter with nothing in
+      // it falls back to showing everything.
+      const kinds = filters.filter(([f, , n]) => f !== 'all' && n).length;
+      ui.filters.hidden = kinds < 2;
+      const active = kinds < 2 ? 'all' : (filters.find(([f, , n]) => f === state.filter && n)?.[0] ?? 'all');
+      for (const [filter, label, n] of kinds < 2 ? [] : filters) {
         if (!n && filter !== 'all') continue;
         const chip = el('button', 'filter');
         chip.type = 'button';

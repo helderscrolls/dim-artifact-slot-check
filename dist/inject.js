@@ -782,8 +782,10 @@ li{margin:2px 0}
           ["broken", "Check artifact", count("broken")],
           ["ok", "OK", count("ok")]
         ];
-        const active = filters.find(([f, , n]) => f === state.filter && n)?.[0] ?? "all";
-        for (const [filter, label, n] of filters) {
+        const kinds = filters.filter(([f, , n]) => f !== "all" && n).length;
+        ui.filters.hidden = kinds < 2;
+        const active = kinds < 2 ? "all" : filters.find(([f, , n]) => f === state.filter && n)?.[0] ?? "all";
+        for (const [filter, label, n] of kinds < 2 ? [] : filters) {
           if (!n && filter !== "all") continue;
           const chip = el("button", "filter");
           chip.type = "button";
