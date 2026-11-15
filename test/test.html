@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Artifact Slot Check test page</title>
+<style>body{background:#11121a;color:#cfd1de;font:14px system-ui,sans-serif;padding:24px;min-height:100vh}pre{white-space:pre-wrap}</style>
+</head>
+<body>
+<h1>Artifact Slot Check test page</h1>
+<p>Made-up data. The panel in the bottom-left corner is the extension UI.</p>
+<pre id="out"></pre>
+<script src="fixture.js"></script>
+<script src="../dist/inject.js"></script>
+<script>
+(function () {
+  var out = document.getElementById('out');
+  var failed = 0, passed = 0;
+  function check(name, actual, expected) {
+    var ok = JSON.stringify(actual) === JSON.stringify(expected);
+    ok ? passed++ : failed++;
+    out.textContent += (ok ? 'PASS ' : 'FAIL ') + name + (ok ? '' : '\n  got      ' + JSON.stringify(actual) + '\n  expected ' + JSON.stringify(expected)) + '\n';
+  }
+  var core = window.__dimArtifactSlotCheck.core, P = FIXTURE.P;
+  var a = core.analyze(FIXTURE.profile);
+  var warlock = a.characters.find(function (c) { return c.classType === 2; });
+  var hunter = a.characters.find(function (c) { return c.classType === 1; });
+  var by = {}; warlock.slots.forEach(function (s) { by[s.index] = s; });
+
+  check('warlock slots with an artifact', warlock.slots.map(function (s) { return s.index; }), [0, 1, 2, 5]);
+  check('saved loadout without artifact counted', warlock.savedWithoutArtifact, 1);
+  check('statuses: a clash outranks an artifact mismatch', [by[0].status, by[1].status, by[2].status, by[5].status], ['clash', 'clash', 'clash', 'ok']);
+  check('slot 1 broken perks', by[0].brokenNow, [
+    { perkHash: P.harvest, saved: 4, current: 5 }, { perkHash: P.shuttle, saved: 5, current: 4 }]);
+  check('slot 1 clashes only with slot 2', by[0].clashes.map(function (c) { return c.otherIndex; }), [1]);
+  check('slot 2 clashes with slots 1 and 3', by[1].clashes.map(function (c) { return [c.otherIndex, c.perks.length]; }), [[0, 2], [2, 1]]);
+  check('slot 3 broken on Horde Shuttle', by[2].brokenNow, [{ perkHash: P.shuttle, saved: 5, current: 4 }]);
+  check('partial slot ignores unset and empty plugs', [by[5].brokenNow.length, by[5].clashes.length], [0, 0]);
+  check('hunter slot broken by a rearranged artifact, with no clash', [hunter.slots[0].status, hunter.slots[0].clashes.length], ['broken', 0]);
+  check('summary', core.summarize(a), { slots: 5, broken: 1, clashing: 3 });
+  check('layoutFrom drops repeated hashes', Array.from(core.layoutFrom([5, 9, 9, 0, core.UNSET_PLUG_HASH, 7])), [[5, 0], [7, 5]]);
+
+  check('layoutFrom skips a single Empty Artifact Mod', Array.from(core.layoutFrom([5, 1235188590, 7])), [[5, 0], [7, 2]]);
+
+  var plan = warlock.plans[0];
+  check('one plan, for the clashing artifact', [warlock.plans.length, hunter.plans.length], [1, 0]);
+  check('plan re-saves one slot and drops none', [plan.changes.map(function (c) { return c.index; }), plan.excluded.length, plan.exhaustive], [[1], 0, true]);
+  check('plan moves are 1-based and line the perks up', plan.changes[0].moves, [
+    { perkHash: P.harvest, from: 5, to: 4 }, { perkHash: P.shuttle, from: 4, to: 5 }]);
+
+  out.textContent += '\n' + passed + ' passed, ' + failed + ' failed\n';
+  window.testResult = { passed: passed, failed: failed };
+
+  // Drive the page script the way DIM would: Request objects through fetch.
+  fetch(new Request('https://www.bungie.net/Platform/Destiny2/Manifest/'));
+  fetch(new Request('https://www.bungie.net/Platform/Destiny2/3/Profile/123/?components=100,206'));
+})();
+</script>
+</body>
+</html>
