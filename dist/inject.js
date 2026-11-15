@@ -22,274 +22,360 @@
   });
 
   // src/layout.ts
-  var NODE_BUDGET = 4e5;
-  var NODES_PER_ATTEMPT = 4e4;
+  var TOTAL_SEARCH_STEPS = 4e5;
+  var STEPS_PER_ATTEMPT = 4e4;
   var MAX_BUILDS_FOR_FULL_SEARCH = 12;
-  var popcount = (n) => {
-    let count = 0;
-    for (let v = n; v; v &= v - 1) count++;
-    return count;
-  };
-  function planLayout(slots, allowed) {
-    const byPerkSet = /* @__PURE__ */ new Map();
-    for (const slot of slots) {
-      const perks = [...slot.layout.keys()].sort((a, b) => a - b);
-      const key = perks.join(",");
-      const build = byPerkSet.get(key) ?? { perks, slots: [] };
-      build.slots.push(slot);
-      byPerkSet.set(key, build);
+  var MAX_BUILDS_LEFT_OUT_WHEN_MANY = 2;
+  function planLayout(slots, getAllowedPositions) {
+    const builds = groupSlotsIntoBuilds(slots);
+    const totalBudget = { stepsLeft: TOTAL_SEARCH_STEPS };
+    let bestOption = null;
+    let searchWasComplete = true;
+    for (const option of listLeaveOutOptions(builds)) {
+      if (bestOption && option.slotsLost > bestOption.option.slotsLost) break;
+      const buildsToKeep = builds.filter((_, buildIndex) => !option.leftOutBuildIndexes.has(buildIndex));
+      const attemptBudget = { stepsLeft: Math.min(STEPS_PER_ATTEMPT, totalBudget.stepsLeft) };
+      const stepsGranted = attemptBudget.stepsLeft;
+      const costToBeat = bestOption ? bestOption.solution.slotsToResave : Infinity;
+      const solution = findHomePositions(buildsToKeep, getAllowedPositions, attemptBudget, costToBeat);
+      const stepsUsed = stepsGranted - Math.max(attemptBudget.stepsLeft, 0);
+      totalBudget.stepsLeft -= stepsUsed;
+      if (attemptBudget.stepsLeft <= 0) searchWasComplete = false;
+      if (solution && (!bestOption || solution.slotsToResave < bestOption.solution.slotsToResave)) {
+        bestOption = { option, solution };
+      }
+      if (totalBudget.stepsLeft <= 0) break;
     }
-    const builds = [...byPerkSet.values()];
-    const budget = { nodes: NODE_BUDGET };
-    const fullSearch = builds.length <= MAX_BUILDS_FOR_FULL_SEARCH;
-    const candidates = [];
-    for (let mask = 0; mask < 1 << builds.length; mask++) {
-      if (!fullSearch && popcount(mask) > 2) continue;
-      let lost = 0;
-      builds.forEach((build, i) => {
-        if (mask & 1 << i) lost += build.slots.length;
-      });
-      candidates.push({ mask, lost });
-    }
-    candidates.sort((a, b) => a.lost - b.lost || popcount(a.mask) - popcount(b.mask));
-    let best = null;
-    let exhaustive = true;
-    for (const candidate of candidates) {
-      if (best && candidate.lost > best.lost) break;
-      const included = builds.filter((_, i) => !(candidate.mask & 1 << i));
-      const attempt = { nodes: Math.min(NODES_PER_ATTEMPT, budget.nodes) };
-      const granted = attempt.nodes;
-      const solution = solve(included, allowed, attempt, best?.solution.cost ?? Infinity);
-      budget.nodes -= granted - Math.max(attempt.nodes, 0);
-      if (attempt.nodes <= 0) exhaustive = false;
-      if (solution && (!best || solution.cost < best.solution.cost)) best = { ...candidate, solution };
-      if (budget.nodes <= 0) break;
-    }
-    const ref = ({ index, nameHash }) => ({ index, nameHash });
-    const result = { changes: [], unchanged: [], excluded: [], exhaustive };
-    if (!best) {
-      result.excluded = slots.map(ref);
+    const result = { changes: [], unchanged: [], excluded: [], exhaustive: searchWasComplete };
+    if (!bestOption) {
+      result.excluded = slots.map(toSlotRef);
       return result;
     }
-    builds.forEach((build, i) => {
+    const { option: chosenOption, solution: chosenSolution } = bestOption;
+    builds.forEach((build, buildIndex) => {
       for (const slot of build.slots) {
-        if (best.mask & 1 << i) {
-          result.excluded.push(ref(slot));
+        if (chosenOption.leftOutBuildIndexes.has(buildIndex)) {
+          result.excluded.push(toSlotRef(slot));
           continue;
         }
         const moves = [];
-        for (const [perkHash, from] of slot.layout) {
-          const to = best.solution.homes.get(perkHash);
-          if (to !== from) moves.push({ perkHash, from, to });
+        for (const [perkHash, currentPosition] of slot.layout) {
+          const homePosition = chosenSolution.homePositions.get(perkHash);
+          if (homePosition !== currentPosition) {
+            moves.push({ perkHash, from: currentPosition, to: homePosition });
+          }
         }
-        moves.sort((a, b) => a.to - b.to);
-        if (moves.length) result.changes.push({ ...ref(slot), moves });
-        else result.unchanged.push(ref(slot));
+        moves.sort((moveA, moveB) => moveA.to - moveB.to);
+        if (moves.length > 0) result.changes.push({ ...toSlotRef(slot), moves });
+        else result.unchanged.push(toSlotRef(slot));
       }
     });
-    const bySlot = (a, b) => a.index - b.index;
-    result.changes.sort(bySlot);
-    result.unchanged.sort(bySlot);
-    result.excluded.sort(bySlot);
+    const bySlotNumber = (slotA, slotB) => slotA.index - slotB.index;
+    result.changes.sort(bySlotNumber);
+    result.unchanged.sort(bySlotNumber);
+    result.excluded.sort(bySlotNumber);
     return result;
   }
-  function solve(builds, allowed, budget, costLimit) {
-    const slots = builds.flatMap((build) => build.slots);
-    const slotNumber = new Map(slots.map((slot, i) => [slot, i]));
-    const perkMap = /* @__PURE__ */ new Map();
-    builds.forEach((build, buildIndex) => {
-      for (const hash of build.perks) {
-        const perk = perkMap.get(hash) ?? { hash, domain: [], builds: [], saved: [] };
-        perk.builds.push(buildIndex);
-        for (const slot of build.slots) {
-          perk.saved.push({ slot: slotNumber.get(slot), position: slot.layout.get(hash) });
-        }
-        perkMap.set(hash, perk);
-      }
-    });
-    for (const perk of perkMap.values()) {
-      const positions = /* @__PURE__ */ new Set([...allowed(perk.hash), ...perk.saved.map((s) => s.position)]);
-      const uses = (position) => perk.saved.filter((s) => s.position === position).length;
-      perk.domain = [...positions].sort((a, b) => uses(b) - uses(a) || a - b);
+  function toSlotRef(slot) {
+    return { index: slot.index, nameHash: slot.nameHash };
+  }
+  function groupSlotsIntoBuilds(slots) {
+    const buildsByPerkSet = /* @__PURE__ */ new Map();
+    for (const slot of slots) {
+      const perkHashes = [...slot.layout.keys()].sort((hashA, hashB) => hashA - hashB);
+      const perkSetKey = perkHashes.join(",");
+      const build = buildsByPerkSet.get(perkSetKey) ?? { perkHashes, slots: [] };
+      build.slots.push(slot);
+      buildsByPerkSet.set(perkSetKey, build);
     }
-    const perks = [...perkMap.values()].sort(
-      (a, b) => a.domain.length - b.domain.length || b.builds.length - a.builds.length
+    return [...buildsByPerkSet.values()];
+  }
+  function listLeaveOutOptions(builds) {
+    const tryEverySubset = builds.length <= MAX_BUILDS_FOR_FULL_SEARCH;
+    const options = [];
+    const subsetCount = 2 ** builds.length;
+    for (let switches = 0; switches < subsetCount; switches++) {
+      const leftOutBuildIndexes = /* @__PURE__ */ new Set();
+      builds.forEach((_, buildIndex) => {
+        const switchIsOn = Math.floor(switches / 2 ** buildIndex) % 2 === 1;
+        if (switchIsOn) leftOutBuildIndexes.add(buildIndex);
+      });
+      if (!tryEverySubset && leftOutBuildIndexes.size > MAX_BUILDS_LEFT_OUT_WHEN_MANY) continue;
+      let slotsLost = 0;
+      for (const buildIndex of leftOutBuildIndexes) {
+        slotsLost += builds[buildIndex].slots.length;
+      }
+      options.push({ leftOutBuildIndexes, slotsLost });
+    }
+    options.sort(
+      (optionA, optionB) => optionA.slotsLost - optionB.slotsLost || optionA.leftOutBuildIndexes.size - optionB.leftOutBuildIndexes.size
     );
-    const occupied = new Array(builds.length).fill(0);
-    const mismatches = new Array(slots.length).fill(0);
-    const homes = /* @__PURE__ */ new Map();
-    let cost = 0;
-    let best = null;
-    let limit = costLimit;
-    const search = (depth) => {
-      if (budget.nodes-- <= 0 || cost >= limit) return;
-      const perk = perks[depth];
+    return options;
+  }
+  function findHomePositions(builds, getAllowedPositions, searchBudget, costToBeat) {
+    const perksInSearchOrder = describePerks(builds, getAllowedPositions);
+    const homePositions = /* @__PURE__ */ new Map();
+    let slotsToResave = 0;
+    let bestSolution = null;
+    let cheapestCostToBeat = costToBeat;
+    const placePerk = (perkNumber) => {
+      const hadStepsLeft = searchBudget.stepsLeft > 0;
+      searchBudget.stepsLeft -= 1;
+      if (!hadStepsLeft || slotsToResave >= cheapestCostToBeat) return;
+      const perk = perksInSearchOrder[perkNumber];
       if (!perk) {
-        best = { homes: new Map(homes), cost };
-        limit = cost;
+        bestSolution = { homePositions: new Map(homePositions), slotsToResave };
+        cheapestCostToBeat = slotsToResave;
         return;
       }
-      for (const position of perk.domain) {
-        const bit = 1 << position;
-        if (perk.builds.some((b) => occupied[b] & bit)) continue;
-        for (const b of perk.builds) occupied[b] |= bit;
-        for (const s of perk.saved) {
-          if (s.position !== position && mismatches[s.slot]++ === 0) cost++;
+      for (const position of perk.candidatePositions) {
+        const positionIsFree = perk.buildsUsingPerk.every((buildState) => !buildState.takenPositions.has(position));
+        if (!positionIsFree) continue;
+        for (const buildState of perk.buildsUsingPerk) buildState.takenPositions.add(position);
+        for (const { slotState, savedPosition } of perk.savedPositions) {
+          if (savedPosition === position) continue;
+          if (slotState.mismatchCount === 0) slotsToResave += 1;
+          slotState.mismatchCount += 1;
         }
-        homes.set(perk.hash, position);
-        search(depth + 1);
-        for (const b of perk.builds) occupied[b] &= ~bit;
-        for (const s of perk.saved) {
-          if (s.position !== position && --mismatches[s.slot] === 0) cost--;
+        homePositions.set(perk.perkHash, position);
+        placePerk(perkNumber + 1);
+        for (const buildState of perk.buildsUsingPerk) buildState.takenPositions.delete(position);
+        for (const { slotState, savedPosition } of perk.savedPositions) {
+          if (savedPosition === position) continue;
+          slotState.mismatchCount -= 1;
+          if (slotState.mismatchCount === 0) slotsToResave -= 1;
         }
-        homes.delete(perk.hash);
+        homePositions.delete(perk.perkHash);
       }
     };
-    search(0);
-    return best;
+    placePerk(0);
+    return bestSolution;
+  }
+  function describePerks(builds, getAllowedPositions) {
+    const buildStates = builds.map(() => ({ takenPositions: /* @__PURE__ */ new Set() }));
+    const slotStates = /* @__PURE__ */ new Map();
+    for (const build of builds) {
+      for (const slot of build.slots) slotStates.set(slot, { mismatchCount: 0 });
+    }
+    const perksByHash = /* @__PURE__ */ new Map();
+    builds.forEach((build, buildIndex) => {
+      for (const perkHash of build.perkHashes) {
+        const perk = perksByHash.get(perkHash) ?? {
+          perkHash,
+          candidatePositions: [],
+          buildsUsingPerk: [],
+          savedPositions: []
+        };
+        perk.buildsUsingPerk.push(buildStates[buildIndex]);
+        for (const slot of build.slots) {
+          perk.savedPositions.push({
+            slotState: slotStates.get(slot),
+            savedPosition: slot.layout.get(perkHash)
+          });
+        }
+        perksByHash.set(perkHash, perk);
+      }
+    });
+    for (const perk of perksByHash.values()) {
+      const legalPositions = /* @__PURE__ */ new Set([
+        ...getAllowedPositions(perk.perkHash),
+        ...perk.savedPositions.map((saved) => saved.savedPosition)
+      ]);
+      const countSlotsUsing = (position) => perk.savedPositions.filter((saved) => saved.savedPosition === position).length;
+      perk.candidatePositions = [...legalPositions].sort(
+        (positionA, positionB) => countSlotsUsing(positionB) - countSlotsUsing(positionA) || positionA - positionB
+      );
+    }
+    return [...perksByHash.values()].sort(
+      (perkA, perkB) => perkA.candidatePositions.length - perkB.candidatePositions.length || perkB.buildsUsingPerk.length - perkA.buildsUsingPerk.length
+    );
   }
 
   // src/clash.ts
   var UNSET_PLUG_HASH = 2166136261;
   var EMPTY_ARTIFACT_PLUG_HASH = 1235188590;
   var ARTIFACT_BUCKET_HASH = 1506418338;
-  function indexItems(profile) {
-    const map = /* @__PURE__ */ new Map();
-    const add = (items) => {
-      for (const item of items ?? []) {
-        if (item.itemInstanceId) map.set(item.itemInstanceId, item);
+  function indexItemsByInstanceId(profile) {
+    const itemsByInstanceId = /* @__PURE__ */ new Map();
+    const addItems = (items = []) => {
+      for (const item of items) {
+        if (item.itemInstanceId) itemsByInstanceId.set(item.itemInstanceId, item);
       }
     };
-    add(profile.profileInventory?.data?.items);
+    addItems(profile.profileInventory?.data?.items);
     for (const component of [profile.characterInventories, profile.characterEquipment]) {
-      for (const inventory of Object.values(component?.data ?? {})) add(inventory.items);
+      for (const inventory of Object.values(component?.data ?? {})) {
+        addItems(inventory.items);
+      }
     }
-    return map;
+    return itemsByInstanceId;
   }
-  function layoutFrom(hashes) {
-    const isPerk = (h) => Boolean(h) && h !== UNSET_PLUG_HASH && h !== EMPTY_ARTIFACT_PLUG_HASH;
-    const counts = /* @__PURE__ */ new Map();
-    for (const h of hashes) {
-      if (isPerk(h)) counts.set(h, (counts.get(h) ?? 0) + 1);
+  function layoutFrom(plugHashes) {
+    const isPerk = (plugHash) => Boolean(plugHash) && plugHash !== UNSET_PLUG_HASH && plugHash !== EMPTY_ARTIFACT_PLUG_HASH;
+    const socketCountPerPlug = /* @__PURE__ */ new Map();
+    for (const plugHash of plugHashes) {
+      if (isPerk(plugHash)) socketCountPerPlug.set(plugHash, (socketCountPerPlug.get(plugHash) ?? 0) + 1);
     }
     const layout = /* @__PURE__ */ new Map();
-    hashes.forEach((h, i) => {
-      if (isPerk(h) && counts.get(h) === 1) layout.set(h, i);
+    plugHashes.forEach((plugHash, socketIndex) => {
+      const appearsOnce = socketCountPerPlug.get(plugHash) === 1;
+      if (isPerk(plugHash) && appearsOnce) layout.set(plugHash, socketIndex);
     });
     return layout;
   }
-  function currentLayout(profile, instanceId) {
-    const sockets = profile.itemComponents?.sockets?.data?.[instanceId]?.sockets;
-    return sockets ? layoutFrom(sockets.map((s) => s.plugHash ?? 0)) : null;
+  function readCurrentLayout(profile, artifactInstanceId) {
+    const sockets = profile.itemComponents?.sockets?.data?.[artifactInstanceId]?.sockets;
+    if (!sockets) return null;
+    return layoutFrom(sockets.map((socket) => socket.plugHash ?? 0));
   }
-  var positionOf = (socketIndex) => socketIndex + 1;
-  var tierKey = (artifactHash, perkHash) => `${artifactHash}:${Math.floor(perkHash / 8)}`;
-  function observedPositions(profile, items) {
-    const seen = /* @__PURE__ */ new Map();
-    const note = (artifactHash, layout) => {
+  var toPosition = (socketIndex) => socketIndex + 1;
+  var PERK_HASHES_PER_TIER = 8;
+  var makeTierKey = (artifactHash, perkHash) => `${artifactHash}:${Math.floor(perkHash / PERK_HASHES_PER_TIER)}`;
+  function collectPositionsSeenPerTier(profile, itemsByInstanceId) {
+    const positionsSeenPerTier = /* @__PURE__ */ new Map();
+    const recordLayout = (artifactHash, layout) => {
       for (const [perkHash, socketIndex] of layout) {
-        const key = tierKey(artifactHash, perkHash);
-        seen.set(key, (seen.get(key) ?? /* @__PURE__ */ new Set()).add(socketIndex));
+        const tierKey = makeTierKey(artifactHash, perkHash);
+        const positionsSeen = positionsSeenPerTier.get(tierKey) ?? /* @__PURE__ */ new Set();
+        positionsSeen.add(socketIndex);
+        positionsSeenPerTier.set(tierKey, positionsSeen);
       }
     };
-    for (const [instanceId, item] of items) {
+    for (const [instanceId, item] of itemsByInstanceId) {
       if (item.bucketHash !== ARTIFACT_BUCKET_HASH) continue;
-      const current = currentLayout(profile, instanceId);
-      if (current) note(item.itemHash, current);
+      const layoutNow = readCurrentLayout(profile, instanceId);
+      if (layoutNow) recordLayout(item.itemHash, layoutNow);
     }
     for (const { loadouts = [] } of Object.values(profile.characterLoadouts?.data ?? {})) {
       for (const loadout of loadouts) {
-        for (const saved of loadout.items ?? []) {
-          const item = items.get(saved.itemInstanceId);
-          if (item?.bucketHash === ARTIFACT_BUCKET_HASH) note(item.itemHash, layoutFrom(saved.plugItemHashes ?? []));
+        for (const savedItem of loadout.items ?? []) {
+          const item = itemsByInstanceId.get(savedItem.itemInstanceId);
+          if (item?.bucketHash === ARTIFACT_BUCKET_HASH) {
+            recordLayout(item.itemHash, layoutFrom(savedItem.plugItemHashes ?? []));
+          }
         }
       }
     }
-    return seen;
+    return positionsSeenPerTier;
   }
   function analyze(profile) {
-    const items = indexItems(profile);
-    const seen = observedPositions(profile, items);
+    const itemsByInstanceId = indexItemsByInstanceId(profile);
+    const positionsSeenPerTier = collectPositionsSeenPerTier(profile, itemsByInstanceId);
     const characters = [];
     for (const [characterId, { loadouts = [] }] of Object.entries(profile.characterLoadouts?.data ?? {})) {
-      const slots = [];
-      let savedWithoutArtifact = 0;
-      loadouts.forEach((loadout, index) => {
-        const saved = (loadout.items ?? []).filter((it) => it.itemInstanceId && it.itemInstanceId !== "0");
-        if (!saved.length) return;
-        const artifact = saved.find((it) => items.get(it.itemInstanceId)?.bucketHash === ARTIFACT_BUCKET_HASH);
-        const layout = artifact ? layoutFrom(artifact.plugItemHashes ?? []) : null;
-        if (!artifact || !layout?.size) {
-          savedWithoutArtifact++;
-          return;
-        }
-        slots.push({
-          index,
-          nameHash: loadout.nameHash,
-          instanceId: artifact.itemInstanceId,
-          artifactHash: items.get(artifact.itemInstanceId).itemHash,
-          layout
-        });
-      });
-      const results = slots.map((slot) => {
-        const current = currentLayout(profile, slot.instanceId);
-        const brokenNow = [];
-        for (const [perkHash, socketIndex] of slot.layout) {
-          const currentIndex = current?.get(perkHash);
-          if (currentIndex !== void 0 && currentIndex !== socketIndex) {
-            brokenNow.push({ perkHash, saved: positionOf(socketIndex), current: positionOf(currentIndex) });
-          }
-        }
-        const clashes = [];
-        for (const other of slots) {
-          if (other === slot || other.instanceId !== slot.instanceId) continue;
-          const perks = [];
-          for (const [perkHash, socketIndex] of slot.layout) {
-            const otherIndex = other.layout.get(perkHash);
-            if (otherIndex !== void 0 && otherIndex !== socketIndex) {
-              perks.push({ perkHash, here: positionOf(socketIndex), there: positionOf(otherIndex) });
-            }
-          }
-          if (perks.length) clashes.push({ otherIndex: other.index, otherNameHash: other.nameHash, perks });
-        }
-        return {
-          index: slot.index,
-          nameHash: slot.nameHash,
-          artifactHash: slot.artifactHash,
-          currentKnown: current !== null,
-          // A clash comes from saved data and is certain. "Broken now" depends on
-          // Bungie's report of the artifact, which can lag behind in-game edits.
-          status: clashes.length ? "clash" : brokenNow.length ? "broken" : "ok",
-          brokenNow,
-          clashes
-        };
-      });
-      const plans = [];
-      const clashing = new Set(results.filter((r) => r.clashes.length).map((r) => r.index));
-      const byArtifact = /* @__PURE__ */ new Map();
-      for (const slot of slots) byArtifact.set(slot.instanceId, [...byArtifact.get(slot.instanceId) ?? [], slot]);
-      for (const group of byArtifact.values()) {
-        if (!group.some((slot) => clashing.has(slot.index))) continue;
-        const artifactHash = group[0].artifactHash;
-        const plan = planLayout(group, (perkHash) => [...seen.get(tierKey(artifactHash, perkHash)) ?? []]);
-        plans.push({
-          ...plan,
-          artifactHash,
-          changes: plan.changes.map((change) => ({
-            ...change,
-            moves: change.moves.map((m) => ({ ...m, from: positionOf(m.from), to: positionOf(m.to) }))
-          }))
-        });
-      }
+      const { savedSlots, savedWithoutArtifact } = findSavedArtifactSlots(loadouts, itemsByInstanceId);
+      const slotResults = savedSlots.map((savedSlot) => checkSlot(savedSlot, savedSlots, profile));
       characters.push({
         characterId,
         classType: profile.characters?.data?.[characterId]?.classType ?? -1,
-        slots: results,
-        plans,
+        slots: slotResults,
+        plans: makeFixPlans(savedSlots, slotResults, positionsSeenPerTier),
         savedWithoutArtifact
       });
     }
     return { characters };
+  }
+  function findSavedArtifactSlots(loadouts, itemsByInstanceId) {
+    const savedSlots = [];
+    let savedWithoutArtifact = 0;
+    loadouts.forEach((loadout, slotIndex) => {
+      const filledItems = (loadout.items ?? []).filter(
+        (savedItem) => savedItem.itemInstanceId && savedItem.itemInstanceId !== "0"
+      );
+      if (filledItems.length === 0) return;
+      const savedArtifact = filledItems.find(
+        (savedItem) => itemsByInstanceId.get(savedItem.itemInstanceId)?.bucketHash === ARTIFACT_BUCKET_HASH
+      );
+      const layout = savedArtifact ? layoutFrom(savedArtifact.plugItemHashes ?? []) : null;
+      if (!savedArtifact || !layout || layout.size === 0) {
+        savedWithoutArtifact++;
+        return;
+      }
+      savedSlots.push({
+        index: slotIndex,
+        nameHash: loadout.nameHash,
+        artifactInstanceId: savedArtifact.itemInstanceId,
+        artifactHash: itemsByInstanceId.get(savedArtifact.itemInstanceId).itemHash,
+        layout
+      });
+    });
+    return { savedSlots, savedWithoutArtifact };
+  }
+  function checkSlot(slot, allSlots, profile) {
+    const layoutNow = readCurrentLayout(profile, slot.artifactInstanceId);
+    const brokenNow = [];
+    for (const [perkHash, savedSocketIndex] of slot.layout) {
+      const socketIndexNow = layoutNow?.get(perkHash);
+      if (socketIndexNow !== void 0 && socketIndexNow !== savedSocketIndex) {
+        brokenNow.push({
+          perkHash,
+          saved: toPosition(savedSocketIndex),
+          current: toPosition(socketIndexNow)
+        });
+      }
+    }
+    const clashes = [];
+    for (const otherSlot of allSlots) {
+      const isSameSlot = otherSlot === slot;
+      const isOtherArtifact = otherSlot.artifactInstanceId !== slot.artifactInstanceId;
+      if (isSameSlot || isOtherArtifact) continue;
+      const clashingPerks = [];
+      for (const [perkHash, socketIndexHere] of slot.layout) {
+        const socketIndexThere = otherSlot.layout.get(perkHash);
+        if (socketIndexThere !== void 0 && socketIndexThere !== socketIndexHere) {
+          clashingPerks.push({
+            perkHash,
+            here: toPosition(socketIndexHere),
+            there: toPosition(socketIndexThere)
+          });
+        }
+      }
+      if (clashingPerks.length > 0) {
+        clashes.push({ otherIndex: otherSlot.index, otherNameHash: otherSlot.nameHash, perks: clashingPerks });
+      }
+    }
+    let status = "ok";
+    if (clashes.length > 0) status = "clash";
+    else if (brokenNow.length > 0) status = "broken";
+    return {
+      index: slot.index,
+      nameHash: slot.nameHash,
+      artifactHash: slot.artifactHash,
+      currentKnown: layoutNow !== null,
+      status,
+      brokenNow,
+      clashes
+    };
+  }
+  function makeFixPlans(savedSlots, slotResults, positionsSeenPerTier) {
+    const clashingSlotIndexes = new Set(
+      slotResults.filter((slotResult) => slotResult.clashes.length > 0).map((slotResult) => slotResult.index)
+    );
+    const slotsByArtifactInstance = /* @__PURE__ */ new Map();
+    for (const savedSlot of savedSlots) {
+      const slotsOnSameArtifact = slotsByArtifactInstance.get(savedSlot.artifactInstanceId) ?? [];
+      slotsOnSameArtifact.push(savedSlot);
+      slotsByArtifactInstance.set(savedSlot.artifactInstanceId, slotsOnSameArtifact);
+    }
+    const plans = [];
+    for (const slotsOnSameArtifact of slotsByArtifactInstance.values()) {
+      const anySlotClashes = slotsOnSameArtifact.some((slot) => clashingSlotIndexes.has(slot.index));
+      if (!anySlotClashes) continue;
+      const artifactHash = slotsOnSameArtifact[0].artifactHash;
+      const getAllowedPositions = (perkHash) => [
+        ...positionsSeenPerTier.get(makeTierKey(artifactHash, perkHash)) ?? []
+      ];
+      const plan = planLayout(slotsOnSameArtifact, getAllowedPositions);
+      plans.push({
+        ...plan,
+        artifactHash,
+        changes: plan.changes.map((change) => ({
+          ...change,
+          moves: change.moves.map((move) => ({ ...move, from: toPosition(move.from), to: toPosition(move.to) }))
+        }))
+      });
+    }
+    return plans;
   }
   function summarize(analysis) {
     const summary = { slots: 0, broken: 0, clashing: 0 };
@@ -303,40 +389,46 @@
     return summary;
   }
   function debugSnapshot(profile) {
-    const items = indexItems(profile);
-    const labels = /* @__PURE__ */ new Map();
+    const itemsByInstanceId = indexItemsByInstanceId(profile);
+    const labelByInstanceId = /* @__PURE__ */ new Map();
     const artifacts = [];
-    for (const [instanceId, item] of items) {
+    for (const [instanceId, item] of itemsByInstanceId) {
       if (item.bucketHash !== ARTIFACT_BUCKET_HASH) continue;
-      const id = `A${artifacts.length + 1}`;
-      labels.set(instanceId, id);
+      const label = `A${artifacts.length + 1}`;
+      labelByInstanceId.set(instanceId, label);
       const sockets = profile.itemComponents?.sockets?.data?.[instanceId]?.sockets;
-      const plugs = profile.itemComponents?.reusablePlugs?.data?.[instanceId]?.plugs;
+      const reusablePlugsPerSocket = profile.itemComponents?.reusablePlugs?.data?.[instanceId]?.plugs;
       artifacts.push({
-        id,
+        id: label,
         itemHash: item.itemHash,
-        current: sockets ? sockets.map((s) => s.plugHash ?? 0) : null,
-        allowed: plugs ? Object.fromEntries(
-          Object.entries(plugs).map(([socketIndex, list]) => [
+        current: sockets ? sockets.map((socket) => socket.plugHash ?? 0) : null,
+        allowed: reusablePlugsPerSocket ? Object.fromEntries(
+          Object.entries(reusablePlugsPerSocket).map(([socketIndex, reusablePlugs]) => [
             socketIndex,
-            list.map((p) => ({ hash: p.plugItemHash, canInsert: p.canInsert, enabled: p.enabled }))
+            reusablePlugs.map((reusablePlug) => ({
+              hash: reusablePlug.plugItemHash,
+              canInsert: reusablePlug.canInsert,
+              enabled: reusablePlug.enabled
+            }))
           ])
         ) : null
       });
     }
     const characters = Object.entries(profile.characterLoadouts?.data ?? {}).map(([characterId, { loadouts = [] }]) => ({
       classType: profile.characters?.data?.[characterId]?.classType ?? -1,
-      slots: loadouts.flatMap((loadout, slot) => {
-        const saved = (loadout.items ?? []).filter((it) => it.itemInstanceId && it.itemInstanceId !== "0");
-        if (!saved.length) return [];
-        const artifact = saved.find((it) => labels.has(it.itemInstanceId));
+      slots: loadouts.flatMap((loadout, slotIndex) => {
+        const filledItems = (loadout.items ?? []).filter(
+          (savedItem) => savedItem.itemInstanceId && savedItem.itemInstanceId !== "0"
+        );
+        if (filledItems.length === 0) return [];
+        const savedArtifact = filledItems.find((savedItem) => labelByInstanceId.has(savedItem.itemInstanceId));
         return [
           {
-            slot,
+            slot: slotIndex,
             nameHash: loadout.nameHash,
-            artifact: artifact ? labels.get(artifact.itemInstanceId) : null,
-            plugs: artifact?.plugItemHashes ?? null,
-            itemCount: saved.length
+            artifact: savedArtifact ? labelByInstanceId.get(savedArtifact.itemInstanceId) : null,
+            plugs: savedArtifact?.plugItemHashes ?? null,
+            itemCount: filledItems.length
           }
         ];
       })
@@ -381,37 +473,43 @@
     return newClashes;
   }
   function debugItemHashes(snapshot) {
-    const hashes = /* @__PURE__ */ new Set();
+    const itemHashes = /* @__PURE__ */ new Set();
     for (const artifact of snapshot.artifacts) {
-      hashes.add(artifact.itemHash);
-      for (const h of artifact.current ?? []) hashes.add(h);
-      for (const list of Object.values(artifact.allowed ?? {})) for (const p of list) hashes.add(p.hash);
+      itemHashes.add(artifact.itemHash);
+      for (const plugHash of artifact.current ?? []) itemHashes.add(plugHash);
+      for (const reusablePlugs of Object.values(artifact.allowed ?? {})) {
+        for (const reusablePlug of reusablePlugs) itemHashes.add(reusablePlug.hash);
+      }
     }
     for (const character of snapshot.characters) {
-      for (const slot of character.slots) for (const h of slot.plugs ?? []) hashes.add(h);
+      for (const slot of character.slots) {
+        for (const plugHash of slot.plugs ?? []) itemHashes.add(plugHash);
+      }
     }
-    hashes.delete(0);
-    hashes.delete(UNSET_PLUG_HASH);
-    return hashes;
+    itemHashes.delete(0);
+    itemHashes.delete(UNSET_PLUG_HASH);
+    return itemHashes;
   }
   function neededHashes(analysis) {
-    const items = /* @__PURE__ */ new Set();
-    const loadoutNames = /* @__PURE__ */ new Set();
+    const itemHashes = /* @__PURE__ */ new Set();
+    const loadoutNameHashes = /* @__PURE__ */ new Set();
     for (const character of analysis.characters) {
       for (const plan of character.plans) {
-        for (const change of plan.changes) for (const move of change.moves) items.add(move.perkHash);
+        for (const change of plan.changes) {
+          for (const move of change.moves) itemHashes.add(move.perkHash);
+        }
       }
       for (const slot of character.slots) {
-        items.add(slot.artifactHash);
-        loadoutNames.add(slot.nameHash);
-        for (const perk of slot.brokenNow) items.add(perk.perkHash);
+        itemHashes.add(slot.artifactHash);
+        loadoutNameHashes.add(slot.nameHash);
+        for (const brokenPerk of slot.brokenNow) itemHashes.add(brokenPerk.perkHash);
         for (const clash of slot.clashes) {
-          loadoutNames.add(clash.otherNameHash);
-          for (const perk of clash.perks) items.add(perk.perkHash);
+          loadoutNameHashes.add(clash.otherNameHash);
+          for (const clashPerk of clash.perks) itemHashes.add(clashPerk.perkHash);
         }
       }
     }
-    return { items, loadoutNames };
+    return { items: itemHashes, loadoutNames: loadoutNameHashes };
   }
 
   // src/inject.ts
@@ -554,8 +652,8 @@ li{margin:2px 0}
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url;
         const kind = !url ? null : PROFILE_RE.test(url) ? "profile" : MANIFEST_RE.test(url) ? "manifest" : null;
         if (kind) {
-          promise.then(async (res) => {
-            if (res?.ok) onData(kind, await res.clone().json());
+          promise.then(async (response) => {
+            if (response?.ok) onData(kind, await response.clone().json());
           }).catch(() => {
           });
         }
@@ -590,8 +688,8 @@ li{margin:2px 0}
           state.paths = byLang[lang] ?? byLang[baseLang] ?? byLang.en ?? null;
         }
         void ensureNames();
-      } catch (e) {
-        console.warn(LOG_TAG, e);
+      } catch (error) {
+        console.warn(LOG_TAG, error);
       }
     }
     function readCache() {
@@ -612,14 +710,18 @@ li{margin:2px 0}
       if (!state.analysis) return { items: [], loadouts: [] };
       const needed = neededHashes(state.analysis);
       return {
-        items: [...needed.items, ...extraItemHashes].filter((h) => !names.items[h] && !notFound.has(`i${h}`)),
-        loadouts: [...needed.loadoutNames].filter((h) => !names.loadouts[h] && !notFound.has(`l${h}`))
+        items: [...needed.items, ...extraItemHashes].filter(
+          (itemHash) => !names.items[itemHash] && !notFound.has(`i${itemHash}`)
+        ),
+        loadouts: [...needed.loadoutNames].filter(
+          (nameHash) => !names.loadouts[nameHash] && !notFound.has(`l${nameHash}`)
+        )
       };
     }
     async function fetchTable(path) {
-      const res = await origFetch(`https://www.bungie.net${path}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.json();
+      const response = await origFetch(`https://www.bungie.net${path}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
     }
     function ensureNames() {
       namesJob = namesJob.then(loadMissingNames);
@@ -634,11 +736,11 @@ li{margin:2px 0}
       const itemPath = paths.DestinyInventoryItemLiteDefinition ?? paths.DestinyInventoryItemDefinition;
       if (missing.items.length && itemPath) {
         jobs.push(
-          fetchTable(itemPath).then((defs) => {
-            for (const h of missing.items) {
-              const name = defs[h]?.displayProperties?.name;
-              if (name) names.items[h] = name;
-              else notFound.add(`i${h}`);
+          fetchTable(itemPath).then((itemDefinitions) => {
+            for (const itemHash of missing.items) {
+              const name = itemDefinitions[itemHash]?.displayProperties?.name;
+              if (name) names.items[itemHash] = name;
+              else notFound.add(`i${itemHash}`);
             }
           })
         );
@@ -646,11 +748,11 @@ li{margin:2px 0}
       const loadoutNamePath = paths.DestinyLoadoutNameDefinition;
       if (missing.loadouts.length && loadoutNamePath) {
         jobs.push(
-          fetchTable(loadoutNamePath).then((defs) => {
-            for (const h of missing.loadouts) {
-              const name = defs[h]?.name;
-              if (name) names.loadouts[h] = name;
-              else notFound.add(`l${h}`);
+          fetchTable(loadoutNamePath).then((loadoutNameDefinitions) => {
+            for (const nameHash of missing.loadouts) {
+              const name = loadoutNameDefinitions[nameHash]?.name;
+              if (name) names.loadouts[nameHash] = name;
+              else notFound.add(`l${nameHash}`);
             }
           })
         );
@@ -665,12 +767,12 @@ li{margin:2px 0}
     async function exportDebug() {
       const snapshot = state.debug;
       if (!snapshot) return;
-      for (const h of debugItemHashes(snapshot)) extraItemHashes.add(h);
+      for (const itemHash of debugItemHashes(snapshot)) extraItemHashes.add(itemHash);
       await ensureNames();
       const itemNames = {};
-      for (const h of debugItemHashes(snapshot)) {
-        const name = names.items[h];
-        if (name) itemNames[h] = name;
+      for (const itemHash of debugItemHashes(snapshot)) {
+        const name = names.items[itemHash];
+        if (name) itemNames[itemHash] = name;
       }
       const report = {
         tool: "dim-artifact-slot-check",
@@ -751,17 +853,19 @@ li{margin:2px 0}
       exportButton.title = "Saves the artifact data behind this panel as a JSON file. No account or item ids.";
       exportButton.addEventListener("click", () => {
         exportButton.disabled = true;
-        exportDebug().catch((e) => console.warn(LOG_TAG, "export failed", e)).finally(() => render());
+        exportDebug().catch((error) => console.warn(LOG_TAG, "export failed", error)).finally(() => render());
       });
       foot.append(footText, exportButton);
       const tabs = el("div", "tabs");
       tabs.setAttribute("role", "tablist");
       tabs.hidden = true;
-      tabs.addEventListener("keydown", (e) => {
-        if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-        const all = [...tabs.querySelectorAll(".tab")];
-        const next = all.findIndex((t) => t.getAttribute("aria-selected") === "true") + (e.key === "ArrowRight" ? 1 : -1);
-        all[(next + all.length) % all.length]?.click();
+      tabs.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        const tabButtons = [...tabs.querySelectorAll(".tab")];
+        const selectedIndex = tabButtons.findIndex((tabButton) => tabButton.getAttribute("aria-selected") === "true");
+        const step = event.key === "ArrowRight" ? 1 : -1;
+        const nextIndex = (selectedIndex + step + tabButtons.length) % tabButtons.length;
+        tabButtons[nextIndex]?.click();
       });
       panel.append(head, tabs, filters, body, foot);
       const pill = el("button", "pill");
@@ -799,9 +903,9 @@ li{margin:2px 0}
         setOpen(false);
         pill.focus();
       });
-      shadow.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && state.open) {
-          e.stopPropagation();
+      shadow.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && state.open) {
+          event.stopPropagation();
           setOpen(false);
           pill.focus();
         }
@@ -852,17 +956,19 @@ li{margin:2px 0}
         body.scrollTop = shownKey === shownBefore ? scrollTop : 0;
         return;
       }
-      const withSlots = state.analysis?.characters.filter((c) => c.slots.length) ?? [];
-      const character = withSlots.find((c) => c.characterId === state.tab) ?? withSlots.find((c) => c.slots.some((s) => s.status !== "ok")) ?? withSlots[0];
-      ui.tabs.hidden = withSlots.length < 2;
-      for (const c of withSlots) ui.tabs.append(renderTab(c, c === character));
+      const charactersWithSlots = state.analysis?.characters.filter((candidate) => candidate.slots.length > 0) ?? [];
+      const character = charactersWithSlots.find((candidate) => candidate.characterId === state.tab) ?? charactersWithSlots.find((candidate) => candidate.slots.some((slot) => slot.status !== "ok")) ?? charactersWithSlots[0];
+      ui.tabs.hidden = charactersWithSlots.length < 2;
+      for (const tabCharacter of charactersWithSlots) {
+        ui.tabs.append(renderTab(tabCharacter, tabCharacter === character));
+      }
       ui.filters.hidden = !character;
       if (!state.analysis) {
         body.append(el("p", "note", "Waiting for DIM to load your inventory. Refresh DIM if this does not change."));
       } else if (!character) {
         body.append(el("p", "note", "None of your saved in-game loadouts include an artifact with perks."));
       } else {
-        const count = (s) => character.slots.filter((slot) => slot.status === s).length;
+        const count = (status2) => character.slots.filter((slot) => slot.status === status2).length;
         const filters = [
           ["all", "All", character.slots.length],
           ["clash", "Clash", count("clash")],
@@ -911,7 +1017,7 @@ li{margin:2px 0}
     }
     function pairs(rows) {
       const grid = el("div", "kv");
-      for (const [k, v] of rows) grid.append(el("span", "k", k), el("span", "v", v));
+      for (const [name, description] of rows) grid.append(el("span", "k", name), el("span", "v", description));
       return grid;
     }
     function list(tag, lines) {
@@ -922,11 +1028,13 @@ li{margin:2px 0}
     function labelled(label, content) {
       return [el("div", "label", label), typeof content === "string" ? el("div", void 0, content) : content];
     }
-    const slotNames = (refs) => refs.map((r) => slotLabel(r.index, r.nameHash)).join(", ");
+    const slotNames = (slotRefs) => slotRefs.map((slotRef) => slotLabel(slotRef.index, slotRef.nameHash)).join(", ");
     const artifactName = (hash) => names.items[hash] ?? "Artifact";
     function renderTab(character, selected) {
-      const worst = character.slots.some((s) => s.status === "clash") ? "clash" : character.slots.some((s) => s.status === "broken") ? "broken" : "ok";
-      const tab = el("button", `tab ${worst}`);
+      let worstStatus = "ok";
+      if (character.slots.some((slot) => slot.status === "clash")) worstStatus = "clash";
+      else if (character.slots.some((slot) => slot.status === "broken")) worstStatus = "broken";
+      const tab = el("button", `tab ${worstStatus}`);
       tab.type = "button";
       tab.setAttribute("role", "tab");
       tab.setAttribute("aria-selected", String(selected));
@@ -1018,19 +1126,20 @@ li{margin:2px 0}
     function renderPlan(characterId, plan) {
       const box = foldable("card", `plan:${characterId}:${plan.artifactHash}`, true);
       const summary = el("summary");
-      const n = plan.changes.length;
+      const slotsToResaveCount = plan.changes.length;
+      const badgeText = slotsToResaveCount > 0 ? `${slotsToResaveCount} ${slotsToResaveCount === 1 ? "slot" : "slots"} to re-save` : "no fix found";
       summary.append(
         el("span", "card-title", `Suggested fix \xB7 ${artifactName(plan.artifactHash)}`),
-        el("span", "badge", n ? `${n} ${n === 1 ? "slot" : "slots"} to re-save` : "no fix found")
+        el("span", "badge", badgeText)
       );
       const content = el("div", "card-body");
-      if (n) {
+      if (slotsToResaveCount > 0) {
         content.append(el("p", "lead", "Move these perks so each one sits in the same position in every slot."));
         for (const change of plan.changes) {
           const step = el("div", "step");
           step.append(
             el("div", "step-title", slotLabel(change.index, change.nameHash)),
-            pairs(change.moves.map((m) => [perkName(m.perkHash), `${ordinal(m.from)} \u2192 ${ordinal(m.to)}`]))
+            pairs(change.moves.map((move) => [perkName(move.perkHash), `${ordinal(move.from)} \u2192 ${ordinal(move.to)}`]))
           );
           content.append(step);
         }
@@ -1059,16 +1168,22 @@ li{margin:2px 0}
       return box;
     }
     function artifactDrift(character) {
-      const planned = new Set(character.plans.map((p) => p.artifactHash));
-      const drifts = /* @__PURE__ */ new Map();
+      const artifactsWithAPlan = new Set(character.plans.map((plan) => plan.artifactHash));
+      const driftByArtifact = /* @__PURE__ */ new Map();
       for (const slot of character.slots) {
-        if (planned.has(slot.artifactHash) || !slot.brokenNow.length) continue;
-        const drift = drifts.get(slot.artifactHash) ?? { artifactHash: slot.artifactHash, moves: /* @__PURE__ */ new Map(), slots: 0 };
+        if (artifactsWithAPlan.has(slot.artifactHash) || slot.brokenNow.length === 0) continue;
+        const drift = driftByArtifact.get(slot.artifactHash) ?? {
+          artifactHash: slot.artifactHash,
+          moves: /* @__PURE__ */ new Map(),
+          slots: 0
+        };
         drift.slots++;
-        for (const p of slot.brokenNow) drift.moves.set(p.perkHash, { from: p.current, to: p.saved });
-        drifts.set(slot.artifactHash, drift);
+        for (const brokenPerk of slot.brokenNow) {
+          drift.moves.set(brokenPerk.perkHash, { from: brokenPerk.current, to: brokenPerk.saved });
+        }
+        driftByArtifact.set(slot.artifactHash, drift);
       }
-      return [...drifts.values()];
+      return [...driftByArtifact.values()];
     }
     function renderDrift(characterId, drift) {
       const box = foldable("card warn", `drift:${characterId}:${drift.artifactHash}`, true);
@@ -1081,9 +1196,9 @@ li{margin:2px 0}
       content.append(
         el("p", "lead", "Your slots agree with each other, but Bungie reports the artifact arranged differently."),
         pairs(
-          [...drift.moves].map(([perkHash, m]) => [
+          [...drift.moves].map(([perkHash, move]) => [
             perkName(perkHash),
-            `reported ${ordinal(m.from)}, saved ${ordinal(m.to)}`
+            `reported ${ordinal(move.from)}, saved ${ordinal(move.to)}`
           ])
         ),
         ...labelled(
@@ -1118,10 +1233,12 @@ li{margin:2px 0}
       if (slot.clashes.length) {
         const byPerk = /* @__PURE__ */ new Map();
         for (const clash of slot.clashes) {
-          for (const p of clash.perks) {
-            const entry = byPerk.get(p.perkHash) ?? { here: p.here, there: /* @__PURE__ */ new Map() };
-            entry.there.set(p.there, [...entry.there.get(p.there) ?? [], String(clash.otherIndex + 1)]);
-            byPerk.set(p.perkHash, entry);
+          for (const clashPerk of clash.perks) {
+            const entry = byPerk.get(clashPerk.perkHash) ?? { here: clashPerk.here, there: /* @__PURE__ */ new Map() };
+            const otherSlotNumbers = entry.there.get(clashPerk.there) ?? [];
+            otherSlotNumbers.push(String(clash.otherIndex + 1));
+            entry.there.set(clashPerk.there, otherSlotNumbers);
+            byPerk.set(clashPerk.perkHash, entry);
           }
         }
         detail.append(
@@ -1141,7 +1258,10 @@ li{margin:2px 0}
           ...labelled(
             "Artifact reported differently",
             pairs(
-              slot.brokenNow.map((p) => [perkName(p.perkHash), `saved ${ordinal(p.saved)}, reported ${ordinal(p.current)}`])
+              slot.brokenNow.map((brokenPerk) => [
+                perkName(brokenPerk.perkHash),
+                `saved ${ordinal(brokenPerk.saved)}, reported ${ordinal(brokenPerk.current)}`
+              ])
             )
           )
         );

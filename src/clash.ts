@@ -8,7 +8,7 @@
  *
  * Pure logic: no DOM, no network.
  */
-import type { ItemComponent, ProfileResponse } from './bungie-types';
+import type { ItemComponent, LoadoutComponent, ProfileResponse } from './bungie-types';
 import { planLayout } from './layout';
 import type { PlanResult } from './layout';
 
@@ -31,7 +31,9 @@ export interface BrokenPerk {
 
 export interface ClashPerk {
   perkHash: number;
+  /** 1-based position in this slot. */
   here: number;
+  /** 1-based position in the other slot. */
   there: number;
 }
 
@@ -81,26 +83,32 @@ export interface Summary {
 /** Perk hash -> socket index. */
 type Layout = Map<number, number>;
 
+/** One in-game loadout slot that holds an artifact with perks. */
 interface SavedSlot {
+  /** 0-based in-game loadout slot. */
   index: number;
   nameHash: number;
-  instanceId: string;
+  artifactInstanceId: string;
   artifactHash: number;
   layout: Layout;
 }
 
-function indexItems(profile: ProfileResponse): Map<string, ItemComponent> {
-  const map = new Map<string, ItemComponent>();
-  const add = (items?: ItemComponent[]) => {
-    for (const item of items ?? []) {
-      if (item.itemInstanceId) map.set(item.itemInstanceId, item);
+function indexItemsByInstanceId(profile: ProfileResponse): Map<string, ItemComponent> {
+  const itemsByInstanceId = new Map<string, ItemComponent>();
+
+  const addItems = (items: ItemComponent[] = []) => {
+    for (const item of items) {
+      if (item.itemInstanceId) itemsByInstanceId.set(item.itemInstanceId, item);
     }
   };
-  add(profile.profileInventory?.data?.items);
+
+  addItems(profile.profileInventory?.data?.items);
   for (const component of [profile.characterInventories, profile.characterEquipment]) {
-    for (const inventory of Object.values(component?.data ?? {})) add(inventory.items);
+    for (const inventory of Object.values(component?.data ?? {})) {
+      addItems(inventory.items);
+    }
   }
-  return map;
+  return itemsByInstanceId;
 }
 
 /**
@@ -109,29 +117,35 @@ function indexItems(profile: ProfileResponse): Map<string, ItemComponent> {
  * that appears in more than one socket, since the game never allows the same
  * perk twice.
  */
-export function layoutFrom(hashes: number[]): Layout {
-  const isPerk = (h: number) => Boolean(h) && h !== UNSET_PLUG_HASH && h !== EMPTY_ARTIFACT_PLUG_HASH;
-  const counts = new Map<number, number>();
-  for (const h of hashes) {
-    if (isPerk(h)) counts.set(h, (counts.get(h) ?? 0) + 1);
+export function layoutFrom(plugHashes: number[]): Layout {
+  const isPerk = (plugHash: number) =>
+    Boolean(plugHash) && plugHash !== UNSET_PLUG_HASH && plugHash !== EMPTY_ARTIFACT_PLUG_HASH;
+
+  const socketCountPerPlug = new Map<number, number>();
+  for (const plugHash of plugHashes) {
+    if (isPerk(plugHash)) socketCountPerPlug.set(plugHash, (socketCountPerPlug.get(plugHash) ?? 0) + 1);
   }
+
   const layout: Layout = new Map();
-  hashes.forEach((h, i) => {
-    if (isPerk(h) && counts.get(h) === 1) layout.set(h, i);
+  plugHashes.forEach((plugHash, socketIndex) => {
+    const appearsOnce = socketCountPerPlug.get(plugHash) === 1;
+    if (isPerk(plugHash) && appearsOnce) layout.set(plugHash, socketIndex);
   });
   return layout;
 }
 
-function currentLayout(profile: ProfileResponse, instanceId: string): Layout | null {
-  const sockets = profile.itemComponents?.sockets?.data?.[instanceId]?.sockets;
-  return sockets ? layoutFrom(sockets.map((s) => s.plugHash ?? 0)) : null;
+/** What the artifact holds right now, as Bungie reports it. Null when Bungie sent no socket data. */
+function readCurrentLayout(profile: ProfileResponse, artifactInstanceId: string): Layout | null {
+  const sockets = profile.itemComponents?.sockets?.data?.[artifactInstanceId]?.sockets;
+  if (!sockets) return null;
+  return layoutFrom(sockets.map((socket) => socket.plugHash ?? 0));
 }
 
 /**
  * The seven perk sockets are the artifact's first sockets (DIM's CSV export
  * shows perks in sockets 0-6), so position = socket index + 1.
  */
-const positionOf = (socketIndex: number) => socketIndex + 1;
+const toPosition = (socketIndex: number) => socketIndex + 1;
 
 /**
  * Perks of one tier have consecutive hashes in a block of eight (seen on all
@@ -140,127 +154,197 @@ const positionOf = (socketIndex: number) => socketIndex + 1;
  * learned instead: a perk may go wherever any perk of its tier has been seen,
  * on this account, for the same artifact.
  */
-const tierKey = (artifactHash: number, perkHash: number) => `${artifactHash}:${Math.floor(perkHash / 8)}`;
+const PERK_HASHES_PER_TIER = 8;
+const makeTierKey = (artifactHash: number, perkHash: number) =>
+  `${artifactHash}:${Math.floor(perkHash / PERK_HASHES_PER_TIER)}`;
 
-function observedPositions(profile: ProfileResponse, items: Map<string, ItemComponent>): Map<string, Set<number>> {
-  const seen = new Map<string, Set<number>>();
-  const note = (artifactHash: number, layout: Layout) => {
+/** For each artifact tier, the socket indexes a perk of that tier has been seen in. */
+function collectPositionsSeenPerTier(
+  profile: ProfileResponse,
+  itemsByInstanceId: Map<string, ItemComponent>,
+): Map<string, Set<number>> {
+  const positionsSeenPerTier = new Map<string, Set<number>>();
+
+  const recordLayout = (artifactHash: number, layout: Layout) => {
     for (const [perkHash, socketIndex] of layout) {
-      const key = tierKey(artifactHash, perkHash);
-      seen.set(key, (seen.get(key) ?? new Set()).add(socketIndex));
+      const tierKey = makeTierKey(artifactHash, perkHash);
+      const positionsSeen = positionsSeenPerTier.get(tierKey) ?? new Set<number>();
+      positionsSeen.add(socketIndex);
+      positionsSeenPerTier.set(tierKey, positionsSeen);
     }
   };
+
   // What every copy of the artifact holds right now, on any character...
-  for (const [instanceId, item] of items) {
+  for (const [instanceId, item] of itemsByInstanceId) {
     if (item.bucketHash !== ARTIFACT_BUCKET_HASH) continue;
-    const current = currentLayout(profile, instanceId);
-    if (current) note(item.itemHash, current);
+    const layoutNow = readCurrentLayout(profile, instanceId);
+    if (layoutNow) recordLayout(item.itemHash, layoutNow);
   }
+
   // ...and what every saved loadout holds.
   for (const { loadouts = [] } of Object.values(profile.characterLoadouts?.data ?? {})) {
     for (const loadout of loadouts) {
-      for (const saved of loadout.items ?? []) {
-        const item = items.get(saved.itemInstanceId);
-        if (item?.bucketHash === ARTIFACT_BUCKET_HASH) note(item.itemHash, layoutFrom(saved.plugItemHashes ?? []));
+      for (const savedItem of loadout.items ?? []) {
+        const item = itemsByInstanceId.get(savedItem.itemInstanceId);
+        if (item?.bucketHash === ARTIFACT_BUCKET_HASH) {
+          recordLayout(item.itemHash, layoutFrom(savedItem.plugItemHashes ?? []));
+        }
       }
     }
   }
-  return seen;
+  return positionsSeenPerTier;
 }
 
 export function analyze(profile: ProfileResponse): Analysis {
-  const items = indexItems(profile);
-  const seen = observedPositions(profile, items);
+  const itemsByInstanceId = indexItemsByInstanceId(profile);
+  const positionsSeenPerTier = collectPositionsSeenPerTier(profile, itemsByInstanceId);
   const characters: CharacterResult[] = [];
 
   for (const [characterId, { loadouts = [] }] of Object.entries(profile.characterLoadouts?.data ?? {})) {
-    const slots: SavedSlot[] = [];
-    let savedWithoutArtifact = 0;
-
-    loadouts.forEach((loadout, index) => {
-      const saved = (loadout.items ?? []).filter((it) => it.itemInstanceId && it.itemInstanceId !== '0');
-      if (!saved.length) return; // empty slot
-      const artifact = saved.find((it) => items.get(it.itemInstanceId)?.bucketHash === ARTIFACT_BUCKET_HASH);
-      const layout = artifact ? layoutFrom(artifact.plugItemHashes ?? []) : null;
-      if (!artifact || !layout?.size) {
-        savedWithoutArtifact++;
-        return;
-      }
-      slots.push({
-        index,
-        nameHash: loadout.nameHash,
-        instanceId: artifact.itemInstanceId,
-        artifactHash: items.get(artifact.itemInstanceId)!.itemHash,
-        layout,
-      });
-    });
-
-    const results = slots.map((slot): SlotResult => {
-      const current = currentLayout(profile, slot.instanceId);
-
-      const brokenNow: BrokenPerk[] = [];
-      for (const [perkHash, socketIndex] of slot.layout) {
-        const currentIndex = current?.get(perkHash);
-        if (currentIndex !== undefined && currentIndex !== socketIndex) {
-          brokenNow.push({ perkHash, saved: positionOf(socketIndex), current: positionOf(currentIndex) });
-        }
-      }
-
-      const clashes: Clash[] = [];
-      for (const other of slots) {
-        if (other === slot || other.instanceId !== slot.instanceId) continue;
-        const perks: ClashPerk[] = [];
-        for (const [perkHash, socketIndex] of slot.layout) {
-          const otherIndex = other.layout.get(perkHash);
-          if (otherIndex !== undefined && otherIndex !== socketIndex) {
-            perks.push({ perkHash, here: positionOf(socketIndex), there: positionOf(otherIndex) });
-          }
-        }
-        if (perks.length) clashes.push({ otherIndex: other.index, otherNameHash: other.nameHash, perks });
-      }
-
-      return {
-        index: slot.index,
-        nameHash: slot.nameHash,
-        artifactHash: slot.artifactHash,
-        currentKnown: current !== null,
-        // A clash comes from saved data and is certain. "Broken now" depends on
-        // Bungie's report of the artifact, which can lag behind in-game edits.
-        status: clashes.length ? 'clash' : brokenNow.length ? 'broken' : 'ok',
-        brokenNow,
-        clashes,
-      };
-    });
-
-    // A suggested layout for each artifact whose slots clash with each other.
-    const plans: ArtifactPlan[] = [];
-    const clashing = new Set(results.filter((r) => r.clashes.length).map((r) => r.index));
-    const byArtifact = new Map<string, SavedSlot[]>();
-    for (const slot of slots) byArtifact.set(slot.instanceId, [...(byArtifact.get(slot.instanceId) ?? []), slot]);
-    for (const group of byArtifact.values()) {
-      if (!group.some((slot) => clashing.has(slot.index))) continue;
-      const artifactHash = group[0]!.artifactHash;
-      const plan = planLayout(group, (perkHash) => [...(seen.get(tierKey(artifactHash, perkHash)) ?? [])]);
-      plans.push({
-        ...plan,
-        artifactHash,
-        changes: plan.changes.map((change) => ({
-          ...change,
-          moves: change.moves.map((m) => ({ ...m, from: positionOf(m.from), to: positionOf(m.to) })),
-        })),
-      });
-    }
+    const { savedSlots, savedWithoutArtifact } = findSavedArtifactSlots(loadouts, itemsByInstanceId);
+    const slotResults = savedSlots.map((savedSlot) => checkSlot(savedSlot, savedSlots, profile));
 
     characters.push({
       characterId,
       classType: profile.characters?.data?.[characterId]?.classType ?? -1,
-      slots: results,
-      plans,
+      slots: slotResults,
+      plans: makeFixPlans(savedSlots, slotResults, positionsSeenPerTier),
       savedWithoutArtifact,
     });
   }
 
   return { characters };
+}
+
+/** Picks out the loadout slots that hold an artifact with perks, and counts the other filled slots. */
+function findSavedArtifactSlots(
+  loadouts: LoadoutComponent[],
+  itemsByInstanceId: Map<string, ItemComponent>,
+): { savedSlots: SavedSlot[]; savedWithoutArtifact: number } {
+  const savedSlots: SavedSlot[] = [];
+  let savedWithoutArtifact = 0;
+
+  loadouts.forEach((loadout, slotIndex) => {
+    const filledItems = (loadout.items ?? []).filter(
+      (savedItem) => savedItem.itemInstanceId && savedItem.itemInstanceId !== '0',
+    );
+    if (filledItems.length === 0) return; // an empty slot
+
+    const savedArtifact = filledItems.find(
+      (savedItem) => itemsByInstanceId.get(savedItem.itemInstanceId)?.bucketHash === ARTIFACT_BUCKET_HASH,
+    );
+    const layout = savedArtifact ? layoutFrom(savedArtifact.plugItemHashes ?? []) : null;
+    if (!savedArtifact || !layout || layout.size === 0) {
+      savedWithoutArtifact++;
+      return;
+    }
+
+    savedSlots.push({
+      index: slotIndex,
+      nameHash: loadout.nameHash,
+      artifactInstanceId: savedArtifact.itemInstanceId,
+      artifactHash: itemsByInstanceId.get(savedArtifact.itemInstanceId)!.itemHash,
+      layout,
+    });
+  });
+
+  return { savedSlots, savedWithoutArtifact };
+}
+
+/** Compares one saved slot with the artifact as it is now, and with every other slot on the same artifact. */
+function checkSlot(slot: SavedSlot, allSlots: SavedSlot[], profile: ProfileResponse): SlotResult {
+  const layoutNow = readCurrentLayout(profile, slot.artifactInstanceId);
+
+  const brokenNow: BrokenPerk[] = [];
+  for (const [perkHash, savedSocketIndex] of slot.layout) {
+    const socketIndexNow = layoutNow?.get(perkHash);
+    if (socketIndexNow !== undefined && socketIndexNow !== savedSocketIndex) {
+      brokenNow.push({
+        perkHash,
+        saved: toPosition(savedSocketIndex),
+        current: toPosition(socketIndexNow),
+      });
+    }
+  }
+
+  const clashes: Clash[] = [];
+  for (const otherSlot of allSlots) {
+    const isSameSlot = otherSlot === slot;
+    const isOtherArtifact = otherSlot.artifactInstanceId !== slot.artifactInstanceId;
+    if (isSameSlot || isOtherArtifact) continue;
+
+    const clashingPerks: ClashPerk[] = [];
+    for (const [perkHash, socketIndexHere] of slot.layout) {
+      const socketIndexThere = otherSlot.layout.get(perkHash);
+      if (socketIndexThere !== undefined && socketIndexThere !== socketIndexHere) {
+        clashingPerks.push({
+          perkHash,
+          here: toPosition(socketIndexHere),
+          there: toPosition(socketIndexThere),
+        });
+      }
+    }
+    if (clashingPerks.length > 0) {
+      clashes.push({ otherIndex: otherSlot.index, otherNameHash: otherSlot.nameHash, perks: clashingPerks });
+    }
+  }
+
+  // A clash comes from saved data and is certain. "Broken now" depends on
+  // Bungie's report of the artifact, which can lag behind in-game edits.
+  let status: SlotStatus = 'ok';
+  if (clashes.length > 0) status = 'clash';
+  else if (brokenNow.length > 0) status = 'broken';
+
+  return {
+    index: slot.index,
+    nameHash: slot.nameHash,
+    artifactHash: slot.artifactHash,
+    currentKnown: layoutNow !== null,
+    status,
+    brokenNow,
+    clashes,
+  };
+}
+
+/** A suggested layout for each artifact whose slots clash with each other. */
+function makeFixPlans(
+  savedSlots: SavedSlot[],
+  slotResults: SlotResult[],
+  positionsSeenPerTier: Map<string, Set<number>>,
+): ArtifactPlan[] {
+  const clashingSlotIndexes = new Set(
+    slotResults.filter((slotResult) => slotResult.clashes.length > 0).map((slotResult) => slotResult.index),
+  );
+
+  const slotsByArtifactInstance = new Map<string, SavedSlot[]>();
+  for (const savedSlot of savedSlots) {
+    const slotsOnSameArtifact = slotsByArtifactInstance.get(savedSlot.artifactInstanceId) ?? [];
+    slotsOnSameArtifact.push(savedSlot);
+    slotsByArtifactInstance.set(savedSlot.artifactInstanceId, slotsOnSameArtifact);
+  }
+
+  const plans: ArtifactPlan[] = [];
+  for (const slotsOnSameArtifact of slotsByArtifactInstance.values()) {
+    const anySlotClashes = slotsOnSameArtifact.some((slot) => clashingSlotIndexes.has(slot.index));
+    if (!anySlotClashes) continue;
+
+    const artifactHash = slotsOnSameArtifact[0]!.artifactHash;
+    const getAllowedPositions = (perkHash: number) => [
+      ...(positionsSeenPerTier.get(makeTierKey(artifactHash, perkHash)) ?? []),
+    ];
+    const plan = planLayout(slotsOnSameArtifact, getAllowedPositions);
+
+    // The layout search works in socket indexes; show people 1-based positions.
+    plans.push({
+      ...plan,
+      artifactHash,
+      changes: plan.changes.map((change) => ({
+        ...change,
+        moves: change.moves.map((move) => ({ ...move, from: toPosition(move.from), to: toPosition(move.to) })),
+      })),
+    });
+  }
+  return plans;
 }
 
 export function summarize(analysis: Analysis | null): Summary {
@@ -298,24 +382,32 @@ export interface DebugSnapshot {
  * account, character or item instance ids.
  */
 export function debugSnapshot(profile: ProfileResponse): DebugSnapshot {
-  const items = indexItems(profile);
-  const labels = new Map<string, string>();
+  const itemsByInstanceId = indexItemsByInstanceId(profile);
+
+  // Real instance ids stay private; each artifact gets a label like "A1" instead.
+  const labelByInstanceId = new Map<string, string>();
   const artifacts: DebugArtifact[] = [];
-  for (const [instanceId, item] of items) {
+  for (const [instanceId, item] of itemsByInstanceId) {
     if (item.bucketHash !== ARTIFACT_BUCKET_HASH) continue;
-    const id = `A${artifacts.length + 1}`;
-    labels.set(instanceId, id);
+
+    const label = `A${artifacts.length + 1}`;
+    labelByInstanceId.set(instanceId, label);
+
     const sockets = profile.itemComponents?.sockets?.data?.[instanceId]?.sockets;
-    const plugs = profile.itemComponents?.reusablePlugs?.data?.[instanceId]?.plugs;
+    const reusablePlugsPerSocket = profile.itemComponents?.reusablePlugs?.data?.[instanceId]?.plugs;
     artifacts.push({
-      id,
+      id: label,
       itemHash: item.itemHash,
-      current: sockets ? sockets.map((s) => s.plugHash ?? 0) : null,
-      allowed: plugs
+      current: sockets ? sockets.map((socket) => socket.plugHash ?? 0) : null,
+      allowed: reusablePlugsPerSocket
         ? Object.fromEntries(
-            Object.entries(plugs).map(([socketIndex, list]) => [
+            Object.entries(reusablePlugsPerSocket).map(([socketIndex, reusablePlugs]) => [
               socketIndex,
-              list.map((p) => ({ hash: p.plugItemHash, canInsert: p.canInsert, enabled: p.enabled })),
+              reusablePlugs.map((reusablePlug) => ({
+                hash: reusablePlug.plugItemHash,
+                canInsert: reusablePlug.canInsert,
+                enabled: reusablePlug.enabled,
+              })),
             ]),
           )
         : null,
@@ -324,17 +416,20 @@ export function debugSnapshot(profile: ProfileResponse): DebugSnapshot {
 
   const characters = Object.entries(profile.characterLoadouts?.data ?? {}).map(([characterId, { loadouts = [] }]) => ({
     classType: profile.characters?.data?.[characterId]?.classType ?? -1,
-    slots: loadouts.flatMap((loadout, slot) => {
-      const saved = (loadout.items ?? []).filter((it) => it.itemInstanceId && it.itemInstanceId !== '0');
-      if (!saved.length) return [];
-      const artifact = saved.find((it) => labels.has(it.itemInstanceId));
+    slots: loadouts.flatMap((loadout, slotIndex) => {
+      const filledItems = (loadout.items ?? []).filter(
+        (savedItem) => savedItem.itemInstanceId && savedItem.itemInstanceId !== '0',
+      );
+      if (filledItems.length === 0) return []; // an empty slot
+
+      const savedArtifact = filledItems.find((savedItem) => labelByInstanceId.has(savedItem.itemInstanceId));
       return [
         {
-          slot,
+          slot: slotIndex,
           nameHash: loadout.nameHash,
-          artifact: artifact ? labels.get(artifact.itemInstanceId)! : null,
-          plugs: artifact?.plugItemHashes ?? null,
-          itemCount: saved.length,
+          artifact: savedArtifact ? labelByInstanceId.get(savedArtifact.itemInstanceId)! : null,
+          plugs: savedArtifact?.plugItemHashes ?? null,
+          itemCount: filledItems.length,
         },
       ];
     }),
@@ -406,37 +501,47 @@ export function findNewClashes(previousAnalysis: Analysis, currentAnalysis: Anal
 
 /** Every item hash that appears in a debug snapshot. */
 export function debugItemHashes(snapshot: DebugSnapshot): Set<number> {
-  const hashes = new Set<number>();
+  const itemHashes = new Set<number>();
+
   for (const artifact of snapshot.artifacts) {
-    hashes.add(artifact.itemHash);
-    for (const h of artifact.current ?? []) hashes.add(h);
-    for (const list of Object.values(artifact.allowed ?? {})) for (const p of list) hashes.add(p.hash);
+    itemHashes.add(artifact.itemHash);
+    for (const plugHash of artifact.current ?? []) itemHashes.add(plugHash);
+    for (const reusablePlugs of Object.values(artifact.allowed ?? {})) {
+      for (const reusablePlug of reusablePlugs) itemHashes.add(reusablePlug.hash);
+    }
   }
   for (const character of snapshot.characters) {
-    for (const slot of character.slots) for (const h of slot.plugs ?? []) hashes.add(h);
+    for (const slot of character.slots) {
+      for (const plugHash of slot.plugs ?? []) itemHashes.add(plugHash);
+    }
   }
-  hashes.delete(0);
-  hashes.delete(UNSET_PLUG_HASH);
-  return hashes;
+
+  // Zero and "unset" are placeholders, not real items.
+  itemHashes.delete(0);
+  itemHashes.delete(UNSET_PLUG_HASH);
+  return itemHashes;
 }
 
 /** Every definition hash the UI needs a name for. */
 export function neededHashes(analysis: Analysis): { items: Set<number>; loadoutNames: Set<number> } {
-  const items = new Set<number>();
-  const loadoutNames = new Set<number>();
+  const itemHashes = new Set<number>();
+  const loadoutNameHashes = new Set<number>();
+
   for (const character of analysis.characters) {
     for (const plan of character.plans) {
-      for (const change of plan.changes) for (const move of change.moves) items.add(move.perkHash);
+      for (const change of plan.changes) {
+        for (const move of change.moves) itemHashes.add(move.perkHash);
+      }
     }
     for (const slot of character.slots) {
-      items.add(slot.artifactHash);
-      loadoutNames.add(slot.nameHash);
-      for (const perk of slot.brokenNow) items.add(perk.perkHash);
+      itemHashes.add(slot.artifactHash);
+      loadoutNameHashes.add(slot.nameHash);
+      for (const brokenPerk of slot.brokenNow) itemHashes.add(brokenPerk.perkHash);
       for (const clash of slot.clashes) {
-        loadoutNames.add(clash.otherNameHash);
-        for (const perk of clash.perks) items.add(perk.perkHash);
+        loadoutNameHashes.add(clash.otherNameHash);
+        for (const clashPerk of clash.perks) itemHashes.add(clashPerk.perkHash);
       }
     }
   }
-  return { items, loadoutNames };
+  return { items: itemHashes, loadoutNames: loadoutNameHashes };
 }

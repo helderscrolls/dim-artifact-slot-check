@@ -3,69 +3,94 @@
 import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 
-const file = process.argv[2];
-if (!file) {
+const exportPath = process.argv[2];
+if (!exportPath) {
   console.error('Usage: node test/check-export.mjs <debug-export.json>');
   process.exit(1);
 }
-const report = JSON.parse(await readFile(file, 'utf8'));
+const report = JSON.parse(await readFile(exportPath, 'utf8'));
 
+// Compile the analysis code on the fly, so this script never uses a stale build.
 const bundle = await build({ entryPoints: ['src/clash.ts'], bundle: true, format: 'esm', write: false });
-const core = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
+const bundledCode = bundle.outputFiles[0].text;
+const core = await import(`data:text/javascript;base64,${Buffer.from(bundledCode).toString('base64')}`);
 
-// Rebuild the parts of Bungie's profile the analysis reads from the export.
+// Rebuild the parts of Bungie's profile that the analysis reads, from the export.
 const { artifacts, characters } = report.snapshot;
 const profile = {
   characters: { data: {} },
   profileInventory: {
     data: {
-      items: artifacts.map((a) => ({ itemInstanceId: a.id, itemHash: a.itemHash, bucketHash: core.ARTIFACT_BUCKET_HASH })),
+      items: artifacts.map((artifact) => ({
+        itemInstanceId: artifact.id,
+        itemHash: artifact.itemHash,
+        bucketHash: core.ARTIFACT_BUCKET_HASH,
+      })),
     },
   },
   itemComponents: {
     sockets: {
       data: Object.fromEntries(
-        artifacts.filter((a) => a.current).map((a) => [a.id, { sockets: a.current.map((plugHash) => ({ plugHash })) }]),
+        artifacts
+          .filter((artifact) => artifact.current)
+          .map((artifact) => [
+            artifact.id,
+            { sockets: artifact.current.map((plugHash) => ({ plugHash })) },
+          ]),
       ),
     },
   },
   characterLoadouts: { data: {} },
 };
-characters.forEach((character, i) => {
+
+characters.forEach((character, characterNumber) => {
   const loadouts = [];
-  for (const slot of character.slots) {
-    loadouts[slot.slot] = {
-      nameHash: slot.nameHash,
-      items: slot.artifact ? [{ itemInstanceId: slot.artifact, plugItemHashes: slot.plugs }] : [{ itemInstanceId: 'other' }],
+  for (const savedSlot of character.slots) {
+    const artifactItem = { itemInstanceId: savedSlot.artifact, plugItemHashes: savedSlot.plugs };
+    const otherItem = { itemInstanceId: 'other' };
+    loadouts[savedSlot.slot] = {
+      nameHash: savedSlot.nameHash,
+      items: savedSlot.artifact ? [artifactItem] : [otherItem],
     };
   }
-  for (let s = 0; s < loadouts.length; s++) loadouts[s] ??= { nameHash: 0, items: [] };
-  profile.characters.data[`C${i}`] = { classType: character.classType };
-  profile.characterLoadouts.data[`C${i}`] = { loadouts };
+  // Slots that were empty in the export become empty loadouts, so slot numbers line up.
+  for (let slotIndex = 0; slotIndex < loadouts.length; slotIndex++) {
+    loadouts[slotIndex] ??= { nameHash: 0, items: [] };
+  }
+  profile.characters.data[`C${characterNumber}`] = { classType: character.classType };
+  profile.characterLoadouts.data[`C${characterNumber}`] = { loadouts };
 });
 
-const perk = (hash) => report.itemNames[hash] ?? `Perk ${hash}`;
-const slot = (ref) => `Slot ${ref.index + 1} ${report.loadoutNames[ref.nameHash] ?? ''}`.trim();
-const CLASSES = { 0: 'Titan', 1: 'Hunter', 2: 'Warlock' };
+const perkName = (hash) => report.itemNames[hash] ?? `Perk ${hash}`;
+const slotName = (slotRef) => `Slot ${slotRef.index + 1} ${report.loadoutNames[slotRef.nameHash] ?? ''}`.trim();
+const CLASS_NAMES = { 0: 'Titan', 1: 'Hunter', 2: 'Warlock' };
 
-const started = performance.now();
+const startTime = performance.now();
 const analysis = core.analyze(profile);
-const elapsed = performance.now() - started;
+const elapsedMilliseconds = performance.now() - startTime;
 
 for (const character of analysis.characters) {
-  if (!character.slots.length) continue;
-  console.log(`\n== ${CLASSES[character.classType] ?? 'Character'} ==`);
-  for (const s of character.slots) {
-    const broken = s.brokenNow.map((p) => `${perk(p.perkHash)} saved ${p.saved} now ${p.current}`).join('; ');
-    console.log(`${slot(s)} [${perk(s.artifactHash)}] ${s.status}${broken ? ` (${broken})` : ''}`);
+  if (character.slots.length === 0) continue;
+
+  console.log(`\n== ${CLASS_NAMES[character.classType] ?? 'Character'} ==`);
+  for (const slot of character.slots) {
+    const brokenText = slot.brokenNow
+      .map((brokenPerk) => `${perkName(brokenPerk.perkHash)} saved ${brokenPerk.saved} now ${brokenPerk.current}`)
+      .join('; ');
+    const suffix = brokenText ? ` (${brokenText})` : '';
+    console.log(`${slotName(slot)} [${perkName(slot.artifactHash)}] ${slot.status}${suffix}`);
   }
+
   for (const plan of character.plans) {
-    console.log(`\nSuggested fix: ${perk(plan.artifactHash)}${plan.exhaustive ? '' : ' (search cut short)'}`);
+    console.log(`\nSuggested fix: ${perkName(plan.artifactHash)}${plan.exhaustive ? '' : ' (search cut short)'}`);
     for (const change of plan.changes) {
-      console.log(`  ${slot(change)}: ${change.moves.map((m) => `${perk(m.perkHash)} ${m.from}->${m.to}`).join(', ')}`);
+      const moveText = change.moves
+        .map((move) => `${perkName(move.perkHash)} ${move.from}->${move.to}`)
+        .join(', ');
+      console.log(`  ${slotName(change)}: ${moveText}`);
     }
-    console.log(`  Already fine: ${plan.unchanged.map(slot).join(', ') || 'none'}`);
-    console.log(`  Can't fit: ${plan.excluded.map(slot).join(', ') || 'none'}`);
+    console.log(`  Already fine: ${plan.unchanged.map(slotName).join(', ') || 'none'}`);
+    console.log(`  Can't fit: ${plan.excluded.map(slotName).join(', ') || 'none'}`);
   }
 }
-console.log(`\nAnalysis took ${elapsed.toFixed(1)} ms`);
+console.log(`\nAnalysis took ${elapsedMilliseconds.toFixed(1)} ms`);

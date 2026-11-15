@@ -227,10 +227,12 @@ function start(): void {
       if (kind) {
         // A separate chain on a clone: DIM's own handling is never touched.
         promise
-          .then(async (res) => {
-            if (res?.ok) onData(kind, await res.clone().json());
+          .then(async (response) => {
+            if (response?.ok) onData(kind, await response.clone().json());
           })
-          .catch(() => {});
+          .catch(() => {
+            /* a failed request is DIM's business, not ours */
+          });
       }
     } catch {
       /* never break DIM */
@@ -267,8 +269,8 @@ function start(): void {
         state.paths = byLang[lang] ?? byLang[baseLang] ?? byLang.en ?? null;
       }
       void ensureNames();
-    } catch (e) {
-      console.warn(LOG_TAG, e);
+    } catch (error) {
+      console.warn(LOG_TAG, error);
     }
   }
 
@@ -296,15 +298,19 @@ function start(): void {
     if (!state.analysis) return { items: [], loadouts: [] };
     const needed = core.neededHashes(state.analysis);
     return {
-      items: [...needed.items, ...extraItemHashes].filter((h) => !names.items[h] && !notFound.has(`i${h}`)),
-      loadouts: [...needed.loadoutNames].filter((h) => !names.loadouts[h] && !notFound.has(`l${h}`)),
+      items: [...needed.items, ...extraItemHashes].filter(
+        (itemHash) => !names.items[itemHash] && !notFound.has(`i${itemHash}`),
+      ),
+      loadouts: [...needed.loadoutNames].filter(
+        (nameHash) => !names.loadouts[nameHash] && !notFound.has(`l${nameHash}`),
+      ),
     };
   }
 
   async function fetchTable<T>(path: string): Promise<Record<number, T | undefined>> {
-    const res = await origFetch(`https://www.bungie.net${path}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    const response = await origFetch(`https://www.bungie.net${path}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
   }
 
   /** Loads any names still missing. Calls queue up, so none overlap. */
@@ -323,11 +329,11 @@ function start(): void {
     const itemPath = paths.DestinyInventoryItemLiteDefinition ?? paths.DestinyInventoryItemDefinition;
     if (missing.items.length && itemPath) {
       jobs.push(
-        fetchTable<{ displayProperties?: { name?: string } }>(itemPath).then((defs) => {
-          for (const h of missing.items) {
-            const name = defs[h]?.displayProperties?.name;
-            if (name) names.items[h] = name;
-            else notFound.add(`i${h}`);
+        fetchTable<{ displayProperties?: { name?: string } }>(itemPath).then((itemDefinitions) => {
+          for (const itemHash of missing.items) {
+            const name = itemDefinitions[itemHash]?.displayProperties?.name;
+            if (name) names.items[itemHash] = name;
+            else notFound.add(`i${itemHash}`);
           }
         }),
       );
@@ -335,11 +341,11 @@ function start(): void {
     const loadoutNamePath = paths.DestinyLoadoutNameDefinition;
     if (missing.loadouts.length && loadoutNamePath) {
       jobs.push(
-        fetchTable<{ name?: string }>(loadoutNamePath).then((defs) => {
-          for (const h of missing.loadouts) {
-            const name = defs[h]?.name;
-            if (name) names.loadouts[h] = name;
-            else notFound.add(`l${h}`);
+        fetchTable<{ name?: string }>(loadoutNamePath).then((loadoutNameDefinitions) => {
+          for (const nameHash of missing.loadouts) {
+            const name = loadoutNameDefinitions[nameHash]?.name;
+            if (name) names.loadouts[nameHash] = name;
+            else notFound.add(`l${nameHash}`);
           }
         }),
       );
@@ -363,13 +369,13 @@ function start(): void {
   async function exportDebug(): Promise<void> {
     const snapshot = state.debug;
     if (!snapshot) return;
-    for (const h of core.debugItemHashes(snapshot)) extraItemHashes.add(h);
+    for (const itemHash of core.debugItemHashes(snapshot)) extraItemHashes.add(itemHash);
     await ensureNames();
 
     const itemNames: Record<number, string> = {};
-    for (const h of core.debugItemHashes(snapshot)) {
-      const name = names.items[h];
-      if (name) itemNames[h] = name;
+    for (const itemHash of core.debugItemHashes(snapshot)) {
+      const name = names.items[itemHash];
+      if (name) itemNames[itemHash] = name;
     }
     const report = {
       tool: 'dim-artifact-slot-check',
@@ -467,18 +473,21 @@ function start(): void {
     exportButton.addEventListener('click', () => {
       exportButton.disabled = true;
       exportDebug()
-        .catch((e) => console.warn(LOG_TAG, 'export failed', e))
+        .catch((error) => console.warn(LOG_TAG, 'export failed', error))
         .finally(() => render());
     });
     foot.append(footText, exportButton);
     const tabs = el('div', 'tabs');
     tabs.setAttribute('role', 'tablist');
     tabs.hidden = true;
-    tabs.addEventListener('keydown', (e) => {
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-      const all = [...tabs.querySelectorAll<HTMLElement>('.tab')];
-      const next = all.findIndex((t) => t.getAttribute('aria-selected') === 'true') + (e.key === 'ArrowRight' ? 1 : -1);
-      all[(next + all.length) % all.length]?.click();
+    tabs.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      const tabButtons = [...tabs.querySelectorAll<HTMLElement>('.tab')];
+      const selectedIndex = tabButtons.findIndex((tabButton) => tabButton.getAttribute('aria-selected') === 'true');
+      const step = event.key === 'ArrowRight' ? 1 : -1;
+      // Wrap around at both ends.
+      const nextIndex = (selectedIndex + step + tabButtons.length) % tabButtons.length;
+      tabButtons[nextIndex]?.click();
     });
     panel.append(head, tabs, filters, body, foot);
 
@@ -525,9 +534,9 @@ function start(): void {
       setOpen(false);
       pill.focus();
     });
-    shadow.addEventListener('keydown', (e) => {
-      if ((e as KeyboardEvent).key === 'Escape' && state.open) {
-        e.stopPropagation();
+    shadow.addEventListener('keydown', (event) => {
+      if ((event as KeyboardEvent).key === 'Escape' && state.open) {
+        event.stopPropagation();
         setOpen(false);
         pill.focus();
       }
@@ -591,14 +600,16 @@ function start(): void {
       return;
     }
 
-    const withSlots = state.analysis?.characters.filter((c) => c.slots.length) ?? [];
+    const charactersWithSlots = state.analysis?.characters.filter((candidate) => candidate.slots.length > 0) ?? [];
     // One tab per class. Open on the chosen one, else the first with a problem.
     const character =
-      withSlots.find((c) => c.characterId === state.tab) ??
-      withSlots.find((c) => c.slots.some((s) => s.status !== 'ok')) ??
-      withSlots[0];
-    ui.tabs.hidden = withSlots.length < 2;
-    for (const c of withSlots) ui.tabs.append(renderTab(c, c === character));
+      charactersWithSlots.find((candidate) => candidate.characterId === state.tab) ??
+      charactersWithSlots.find((candidate) => candidate.slots.some((slot) => slot.status !== 'ok')) ??
+      charactersWithSlots[0];
+    ui.tabs.hidden = charactersWithSlots.length < 2;
+    for (const tabCharacter of charactersWithSlots) {
+      ui.tabs.append(renderTab(tabCharacter, tabCharacter === character));
+    }
     ui.filters.hidden = !character;
 
     if (!state.analysis) {
@@ -606,7 +617,7 @@ function start(): void {
     } else if (!character) {
       body.append(el('p', 'note', 'None of your saved in-game loadouts include an artifact with perks.'));
     } else {
-      const count = (s: SlotStatus) => character.slots.filter((slot) => slot.status === s).length;
+      const count = (status: SlotStatus) => character.slots.filter((slot) => slot.status === status).length;
       const filters: [Filter, string, number][] = [
         ['all', 'All', character.slots.length],
         ['clash', 'Clash', count('clash')],
@@ -665,7 +676,7 @@ function start(): void {
   /** Two aligned columns: a bold name and what to know about it. */
   function pairs(rows: [string, string][]): HTMLElement {
     const grid = el('div', 'kv');
-    for (const [k, v] of rows) grid.append(el('span', 'k', k), el('span', 'v', v));
+    for (const [name, description] of rows) grid.append(el('span', 'k', name), el('span', 'v', description));
     return grid;
   }
 
@@ -679,18 +690,18 @@ function start(): void {
     return [el('div', 'label', label), typeof content === 'string' ? el('div', undefined, content) : content];
   }
 
-  const slotNames = (refs: { index: number; nameHash: number }[]) =>
-    refs.map((r) => slotLabel(r.index, r.nameHash)).join(', ');
+  const slotNames = (slotRefs: { index: number; nameHash: number }[]) =>
+    slotRefs.map((slotRef) => slotLabel(slotRef.index, slotRef.nameHash)).join(', ');
 
   const artifactName = (hash: number) => names.items[hash] ?? 'Artifact';
 
   function renderTab(character: CharacterResult, selected: boolean): HTMLElement {
-    const worst = character.slots.some((s) => s.status === 'clash')
-      ? 'clash'
-      : character.slots.some((s) => s.status === 'broken')
-        ? 'broken'
-        : 'ok';
-    const tab = el('button', `tab ${worst}`);
+    // The tab's dot shows the worst status among that class's slots.
+    let worstStatus: SlotStatus = 'ok';
+    if (character.slots.some((slot) => slot.status === 'clash')) worstStatus = 'clash';
+    else if (character.slots.some((slot) => slot.status === 'broken')) worstStatus = 'broken';
+
+    const tab = el('button', `tab ${worstStatus}`);
     tab.type = 'button';
     tab.setAttribute('role', 'tab');
     tab.setAttribute('aria-selected', String(selected));
@@ -808,20 +819,24 @@ function start(): void {
   function renderPlan(characterId: string, plan: ArtifactPlan): HTMLElement {
     const box = foldable('card', `plan:${characterId}:${plan.artifactHash}`, true);
     const summary = el('summary');
-    const n = plan.changes.length;
+    const slotsToResaveCount = plan.changes.length;
+    const badgeText =
+      slotsToResaveCount > 0
+        ? `${slotsToResaveCount} ${slotsToResaveCount === 1 ? 'slot' : 'slots'} to re-save`
+        : 'no fix found';
     summary.append(
       el('span', 'card-title', `Suggested fix · ${artifactName(plan.artifactHash)}`),
-      el('span', 'badge', n ? `${n} ${n === 1 ? 'slot' : 'slots'} to re-save` : 'no fix found'),
+      el('span', 'badge', badgeText),
     );
     const content = el('div', 'card-body');
 
-    if (n) {
+    if (slotsToResaveCount > 0) {
       content.append(el('p', 'lead', 'Move these perks so each one sits in the same position in every slot.'));
       for (const change of plan.changes) {
         const step = el('div', 'step');
         step.append(
           el('div', 'step-title', slotLabel(change.index, change.nameHash)),
-          pairs(change.moves.map((m) => [perkName(m.perkHash), `${ordinal(m.from)} → ${ordinal(m.to)}`])),
+          pairs(change.moves.map((move) => [perkName(move.perkHash), `${ordinal(move.from)} → ${ordinal(move.to)}`])),
         );
         content.append(step);
       }
@@ -859,16 +874,24 @@ function start(): void {
    * report is out of date, or moving the perks on the artifact fixes it.
    */
   function artifactDrift(character: CharacterResult): Drift[] {
-    const planned = new Set(character.plans.map((p) => p.artifactHash));
-    const drifts = new Map<number, Drift>();
+    // Artifacts that already have a suggested fix are explained there instead.
+    const artifactsWithAPlan = new Set(character.plans.map((plan) => plan.artifactHash));
+    const driftByArtifact = new Map<number, Drift>();
     for (const slot of character.slots) {
-      if (planned.has(slot.artifactHash) || !slot.brokenNow.length) continue;
-      const drift = drifts.get(slot.artifactHash) ?? { artifactHash: slot.artifactHash, moves: new Map(), slots: 0 };
+      if (artifactsWithAPlan.has(slot.artifactHash) || slot.brokenNow.length === 0) continue;
+
+      const drift = driftByArtifact.get(slot.artifactHash) ?? {
+        artifactHash: slot.artifactHash,
+        moves: new Map(),
+        slots: 0,
+      };
       drift.slots++;
-      for (const p of slot.brokenNow) drift.moves.set(p.perkHash, { from: p.current, to: p.saved });
-      drifts.set(slot.artifactHash, drift);
+      for (const brokenPerk of slot.brokenNow) {
+        drift.moves.set(brokenPerk.perkHash, { from: brokenPerk.current, to: brokenPerk.saved });
+      }
+      driftByArtifact.set(slot.artifactHash, drift);
     }
-    return [...drifts.values()];
+    return [...driftByArtifact.values()];
   }
 
   function renderDrift(characterId: string, drift: Drift): HTMLElement {
@@ -882,9 +905,9 @@ function start(): void {
     content.append(
       el('p', 'lead', 'Your slots agree with each other, but Bungie reports the artifact arranged differently.'),
       pairs(
-        [...drift.moves].map(([perkHash, m]) => [
+        [...drift.moves].map(([perkHash, move]) => [
           perkName(perkHash),
-          `reported ${ordinal(m.from)}, saved ${ordinal(m.to)}`,
+          `reported ${ordinal(move.from)}, saved ${ordinal(move.to)}`,
         ]),
       ),
       ...labelled(
@@ -925,10 +948,12 @@ function start(): void {
       // One line per perk: where it is here, and where the other slots keep it.
       const byPerk = new Map<number, { here: number; there: Map<number, string[]> }>();
       for (const clash of slot.clashes) {
-        for (const p of clash.perks) {
-          const entry = byPerk.get(p.perkHash) ?? { here: p.here, there: new Map<number, string[]>() };
-          entry.there.set(p.there, [...(entry.there.get(p.there) ?? []), String(clash.otherIndex + 1)]);
-          byPerk.set(p.perkHash, entry);
+        for (const clashPerk of clash.perks) {
+          const entry = byPerk.get(clashPerk.perkHash) ?? { here: clashPerk.here, there: new Map<number, string[]>() };
+          const otherSlotNumbers = entry.there.get(clashPerk.there) ?? [];
+          otherSlotNumbers.push(String(clash.otherIndex + 1));
+          entry.there.set(clashPerk.there, otherSlotNumbers);
+          byPerk.set(clashPerk.perkHash, entry);
         }
       }
       detail.append(
@@ -951,7 +976,10 @@ function start(): void {
         ...labelled(
           'Artifact reported differently',
           pairs(
-            slot.brokenNow.map((p) => [perkName(p.perkHash), `saved ${ordinal(p.saved)}, reported ${ordinal(p.current)}`]),
+            slot.brokenNow.map((brokenPerk) => [
+              perkName(brokenPerk.perkHash),
+              `saved ${ordinal(brokenPerk.saved)}, reported ${ordinal(brokenPerk.current)}`,
+            ]),
           ),
         ),
       );
