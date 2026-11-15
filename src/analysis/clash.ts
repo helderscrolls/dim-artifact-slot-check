@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Clash detection for artifact perks saved in Destiny 2 in-game loadouts.
  *
  * Rule (confirmed by hand in game, Nov 2026): a saved loadout remembers each
@@ -8,16 +8,11 @@
  *
  * Pure logic: no DOM, no network.
  */
-import type { ItemComponent, LoadoutComponent, ProfileResponse } from './bungie-types';
+import type { ItemComponent, LoadoutComponent, ProfileResponse } from '../bungie-types';
+import { ARTIFACT_BUCKET_HASH, EMPTY_ARTIFACT_PLUG_HASH, UNSET_PLUG_HASH } from './constants';
 import { planLayout } from './layout';
 import type { PlanResult } from './layout';
-
-/** Marks "nothing saved for this socket" in an in-game loadout. */
-export const UNSET_PLUG_HASH = 2166136261;
-/** "Empty Artifact Mod": what an artifact socket holds when no perk is slotted. */
-export const EMPTY_ARTIFACT_PLUG_HASH = 1235188590;
-/** Inventory bucket that holds artifacts. */
-export const ARTIFACT_BUCKET_HASH = 1506418338;
+import { indexItemsByInstanceId } from './profile-items';
 
 export type SlotStatus = 'ok' | 'clash' | 'broken';
 
@@ -91,24 +86,6 @@ interface SavedSlot {
   artifactInstanceId: string;
   artifactHash: number;
   layout: Layout;
-}
-
-function indexItemsByInstanceId(profile: ProfileResponse): Map<string, ItemComponent> {
-  const itemsByInstanceId = new Map<string, ItemComponent>();
-
-  const addItems = (items: ItemComponent[] = []) => {
-    for (const item of items) {
-      if (item.itemInstanceId) itemsByInstanceId.set(item.itemInstanceId, item);
-    }
-  };
-
-  addItems(profile.profileInventory?.data?.items);
-  for (const component of [profile.characterInventories, profile.characterEquipment]) {
-    for (const inventory of Object.values(component?.data ?? {})) {
-      addItems(inventory.items);
-    }
-  }
-  return itemsByInstanceId;
 }
 
 /**
@@ -357,169 +334,6 @@ export function summarize(analysis: Analysis | null): Summary {
     }
   }
   return summary;
-}
-
-export interface DebugArtifact {
-  /** Stand-in label; real instance ids are left out of the export. */
-  id: string;
-  itemHash: number;
-  /** Plug hash currently in each socket. */
-  current: number[] | null;
-  /** Per socket index: plugs Bungie says the socket can hold. */
-  allowed: Record<number, { hash: number; canInsert: boolean; enabled: boolean }[]> | null;
-}
-
-export interface DebugSnapshot {
-  artifacts: DebugArtifact[];
-  characters: {
-    classType: number;
-    slots: { slot: number; nameHash: number; artifact: string | null; plugs: number[] | null; itemCount: number }[];
-  }[];
-}
-
-/**
- * The raw artifact data behind an analysis, for troubleshooting. Holds no
- * account, character or item instance ids.
- */
-export function debugSnapshot(profile: ProfileResponse): DebugSnapshot {
-  const itemsByInstanceId = indexItemsByInstanceId(profile);
-
-  // Real instance ids stay private; each artifact gets a label like "A1" instead.
-  const labelByInstanceId = new Map<string, string>();
-  const artifacts: DebugArtifact[] = [];
-  for (const [instanceId, item] of itemsByInstanceId) {
-    if (item.bucketHash !== ARTIFACT_BUCKET_HASH) continue;
-
-    const label = `A${artifacts.length + 1}`;
-    labelByInstanceId.set(instanceId, label);
-
-    const sockets = profile.itemComponents?.sockets?.data?.[instanceId]?.sockets;
-    const reusablePlugsPerSocket = profile.itemComponents?.reusablePlugs?.data?.[instanceId]?.plugs;
-    artifacts.push({
-      id: label,
-      itemHash: item.itemHash,
-      current: sockets ? sockets.map((socket) => socket.plugHash ?? 0) : null,
-      allowed: reusablePlugsPerSocket
-        ? Object.fromEntries(
-            Object.entries(reusablePlugsPerSocket).map(([socketIndex, reusablePlugs]) => [
-              socketIndex,
-              reusablePlugs.map((reusablePlug) => ({
-                hash: reusablePlug.plugItemHash,
-                canInsert: reusablePlug.canInsert,
-                enabled: reusablePlug.enabled,
-              })),
-            ]),
-          )
-        : null,
-    });
-  }
-
-  const characters = Object.entries(profile.characterLoadouts?.data ?? {}).map(([characterId, { loadouts = [] }]) => ({
-    classType: profile.characters?.data?.[characterId]?.classType ?? -1,
-    slots: loadouts.flatMap((loadout, slotIndex) => {
-      const filledItems = (loadout.items ?? []).filter(
-        (savedItem) => savedItem.itemInstanceId && savedItem.itemInstanceId !== '0',
-      );
-      if (filledItems.length === 0) return []; // an empty slot
-
-      const savedArtifact = filledItems.find((savedItem) => labelByInstanceId.has(savedItem.itemInstanceId));
-      return [
-        {
-          slot: slotIndex,
-          nameHash: loadout.nameHash,
-          artifact: savedArtifact ? labelByInstanceId.get(savedArtifact.itemInstanceId)! : null,
-          plugs: savedArtifact?.plugItemHashes ?? null,
-          itemCount: filledItems.length,
-        },
-      ];
-    }),
-  }));
-
-  return { artifacts, characters };
-}
-
-/** A pair of slots that clash now but did not clash at the previous check. */
-export interface NewClash {
-  characterId: string;
-  classType: number;
-  /** 0-based in-game loadout slot numbers, the lower one first. */
-  firstSlotIndex: number;
-  firstSlotNameHash: number;
-  secondSlotIndex: number;
-  secondSlotNameHash: number;
-  /** The perks the two slots disagree about. */
-  perkHashes: number[];
-}
-
-/** The same key whichever of the two slots is named first. */
-function makeSlotPairKey(characterId: string, slotIndexA: number, slotIndexB: number): string {
-  const lowerSlotIndex = Math.min(slotIndexA, slotIndexB);
-  const higherSlotIndex = Math.max(slotIndexA, slotIndexB);
-  return `${characterId}:${lowerSlotIndex}:${higherSlotIndex}`;
-}
-
-/**
- * Compares two checks and returns the slot pairs that clash in the new one
- * but did not in the old one. Pairs that stopped clashing are not reported.
- */
-export function findNewClashes(previousAnalysis: Analysis, currentAnalysis: Analysis): NewClash[] {
-  const previousPairKeys = new Set<string>();
-  for (const character of previousAnalysis.characters) {
-    for (const slot of character.slots) {
-      for (const clash of slot.clashes) {
-        previousPairKeys.add(makeSlotPairKey(character.characterId, slot.index, clash.otherIndex));
-      }
-    }
-  }
-
-  const newClashes: NewClash[] = [];
-  // Each pair shows up twice (once from each slot), so remember what was added.
-  const reportedPairKeys = new Set<string>();
-
-  for (const character of currentAnalysis.characters) {
-    for (const slot of character.slots) {
-      for (const clash of slot.clashes) {
-        const pairKey = makeSlotPairKey(character.characterId, slot.index, clash.otherIndex);
-        if (previousPairKeys.has(pairKey) || reportedPairKeys.has(pairKey)) continue;
-        reportedPairKeys.add(pairKey);
-
-        const thisSlotComesFirst = slot.index < clash.otherIndex;
-        newClashes.push({
-          characterId: character.characterId,
-          classType: character.classType,
-          firstSlotIndex: thisSlotComesFirst ? slot.index : clash.otherIndex,
-          firstSlotNameHash: thisSlotComesFirst ? slot.nameHash : clash.otherNameHash,
-          secondSlotIndex: thisSlotComesFirst ? clash.otherIndex : slot.index,
-          secondSlotNameHash: thisSlotComesFirst ? clash.otherNameHash : slot.nameHash,
-          perkHashes: clash.perks.map((clashPerk) => clashPerk.perkHash),
-        });
-      }
-    }
-  }
-  return newClashes;
-}
-
-/** Every item hash that appears in a debug snapshot. */
-export function debugItemHashes(snapshot: DebugSnapshot): Set<number> {
-  const itemHashes = new Set<number>();
-
-  for (const artifact of snapshot.artifacts) {
-    itemHashes.add(artifact.itemHash);
-    for (const plugHash of artifact.current ?? []) itemHashes.add(plugHash);
-    for (const reusablePlugs of Object.values(artifact.allowed ?? {})) {
-      for (const reusablePlug of reusablePlugs) itemHashes.add(reusablePlug.hash);
-    }
-  }
-  for (const character of snapshot.characters) {
-    for (const slot of character.slots) {
-      for (const plugHash of slot.plugs ?? []) itemHashes.add(plugHash);
-    }
-  }
-
-  // Zero and "unset" are placeholders, not real items.
-  itemHashes.delete(0);
-  itemHashes.delete(UNSET_PLUG_HASH);
-  return itemHashes;
 }
 
 /** Every definition hash the UI needs a name for. */

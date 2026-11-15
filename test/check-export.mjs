@@ -1,4 +1,4 @@
-// Re-runs the analysis on a debug export from the panel and prints the result.
+﻿// Re-runs the analysis on a debug export from the panel and prints the result.
 // Usage: node test/check-export.mjs path/to/artifact-slot-check-debug.json
 import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
@@ -11,7 +11,7 @@ if (!exportPath) {
 const report = JSON.parse(await readFile(exportPath, 'utf8'));
 
 // Compile the analysis code on the fly, so this script never uses a stale build.
-const bundle = await build({ entryPoints: ['src/clash.ts'], bundle: true, format: 'esm', write: false });
+const bundle = await build({ entryPoints: ['src/analysis/index.ts'], bundle: true, format: 'esm', write: false });
 const bundledCode = bundle.outputFiles[0].text;
 const core = await import(`data:text/javascript;base64,${Buffer.from(bundledCode).toString('base64')}`);
 

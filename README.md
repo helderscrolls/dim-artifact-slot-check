@@ -58,9 +58,11 @@ The compiled `dist/` folder is committed, so a fresh clone can be loaded in Chro
 
 ## Files
 
-- `src/clash.ts`: the clash rules, with no page or network code.
-- `src/layout.ts`: works out the suggested fix.
-- `src/inject.ts`: reads DIM's data and draws the panel.
+- `src/inject.ts`: the entry point, 41 lines. Start reading here.
+- `src/analysis/`: the clash rules and the suggested fix. No page code, no network.
+- `src/app/`: listening to Bungie's answers, the shared state, names, the debug export.
+- `src/ui/`: everything drawn on the page.
 - `src/bungie-types.ts`: the parts of Bungie's profile data the extension reads.
 - `src/manifest.json`: the extension manifest, copied into `dist/` by the build.
 - `test/`: a test page with made-up data. Build first, run `test/serve.ps1`, then open `http://localhost:8765/`.
+- `docs/`: [developer documentation](docs/README.md), including what every function does.
