@@ -3,6 +3,9 @@ node_modules/
 # Debug exports from the panel are personal; keep them out of the repo.
 artifact-slot-check-debug*.json
 
+# Claude Code's local preview settings
+.claude/
+
 # Editor and OS clutter
 .vscode/
 .idea/

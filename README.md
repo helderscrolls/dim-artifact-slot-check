@@ -14,6 +14,8 @@ A pill in the bottom-left corner of DIM. Click it for the saved slots that inclu
 - **Clash** (red): this slot and another slot keep a shared perk in different positions. Equipping one will break the other. Only clashes turn the pill red, because they come from your saved data.
 - **Check artifact** (amber): the slot is fine, but Bungie reports the artifact arranged differently. Bungie's report can lag behind in-game changes, so if the artifact looks right in game, ignore it.
 
+When a refresh brings a clash that was not there before (for example after saving a build over a slot), a popup appears in the top right corner for about ten seconds, with an **Open panel** button. It stays while the mouse or keyboard focus is on it. The pill also turns red and says "New clash: slot 3 and slot 11" until you open the panel, which then opens on that class with the details at the top. Only clashes raise this alert, because "Check artifact" can be Bungie's report running behind.
+
 Click a slot to see which perks are involved. The **?** button in the panel header explains all of this inside DIM.
 
 When slots on the same artifact clash, a **Suggested fix** card lists which perks to move in which slots so every shared perk ends up in the same position everywhere. It keeps as many slots as it can, asks for as few re-saves as it can, and names any slot that cannot fit. It only suggests positions it has already seen that kind of perk in on your account.

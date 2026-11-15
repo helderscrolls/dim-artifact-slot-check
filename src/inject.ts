@@ -6,7 +6,15 @@
  */
 import type { ManifestPaths, ManifestResponse, ProfileResponse } from './bungie-types';
 import * as core from './clash';
-import type { Analysis, ArtifactPlan, CharacterResult, DebugSnapshot, SlotResult, SlotStatus } from './clash';
+import type {
+  Analysis,
+  ArtifactPlan,
+  CharacterResult,
+  DebugSnapshot,
+  NewClash,
+  SlotResult,
+  SlotStatus,
+} from './clash';
 
 type Filter = 'all' | SlotStatus;
 
@@ -26,6 +34,8 @@ interface State {
   tab: string | null;
   filter: Filter;
   view: 'main' | 'help';
+  /** Clashes that appeared since the panel was last closed. Cleared once seen. */
+  newClashes: NewClash[];
   /** Raw artifact data behind the analysis, for the debug export. */
   debug: DebugSnapshot | null;
 }
@@ -42,6 +52,9 @@ interface Ui {
   tabs: HTMLElement;
   filters: HTMLElement;
   help: HTMLButtonElement;
+  /** The popup in the top right corner that announces a new clash. */
+  toast: HTMLElement;
+  setOpen: (open: boolean) => void;
   host: HTMLElement;
   pill: HTMLButtonElement;
   label: HTMLElement;
@@ -61,6 +74,10 @@ const MANIFEST_RE = /\/Platform\/Destiny2\/Manifest\/?(\?|$)/i;
 const CACHE_KEY = 'dim-artifact-slot-check:names:v1';
 const CLASS_NAMES: Record<number, string> = { 0: 'Titan', 1: 'Hunter', 2: 'Warlock' };
 const LOG_TAG = '[Artifact Slot Check]';
+/** How long the new-clash popup stays on screen before it hides itself. */
+const TOAST_VISIBLE_MILLISECONDS = 10_000;
+/** The popup lists at most this many clashes; the rest are summarised. */
+const MAX_CLASHES_IN_TOAST = 3;
 
 const CSS = `
 :host{all:initial;position:fixed;left:16px;bottom:16px;z-index:2147483000;
@@ -120,6 +137,9 @@ div.row{padding-left:26px}
 
 .card{margin-bottom:8px;border-radius:8px;border:1px solid #35507a;background:#1f2738}
 .card.warn{border-color:#6b5a2a;background:#2a2619}
+.card.alert{border-color:#7a3a38;background:#2f1d1f}
+.card.alert .card-title{color:#ff9d94}
+.alert-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px}
 .card>summary{display:flex;align-items:baseline;gap:8px;padding:9px 11px;cursor:pointer;list-style:none}
 .card>summary::-webkit-details-marker{display:none}
 .card>summary::before{content:"▸";color:#a5a8be;font-size:10px;width:8px;flex:none}
@@ -145,6 +165,16 @@ li{margin:2px 0}
 .back{border:1px solid #3a3d52;background:none;color:#d3d5e3;font-size:12px;padding:3px 10px;border-radius:5px;cursor:pointer}
 .back:hover{background:#2e3145}
 
+.toast{position:fixed;top:16px;right:16px;width:min(340px,calc(100vw - 32px));padding:11px 14px 12px;
+  border-radius:10px;border:1px solid #7a3a38;background:#2a1b1d;box-shadow:0 10px 32px rgba(0,0,0,.6);
+  animation:toast-in .18s ease-out}
+@keyframes toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.toast{animation:none}}
+.toast-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.toast-title{font-weight:700;color:#ff9d94}
+.toast-line{margin-top:3px;font-size:12px;color:#e3e4ee}
+.toast-line.muted{color:#a5a8be}
+.toast-actions{margin-top:10px}
 .foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 14px;
   border-top:1px solid #2e3145;color:#a5a8be;font-size:11px}
 .export{flex:none;border:1px solid #3a3d52;background:none;color:#d3d5e3;font-size:11px;
@@ -166,6 +196,7 @@ function start(): void {
     tab: null,
     filter: 'all',
     view: 'main',
+    newClashes: [],
   };
   const names = readCache();
   const notFound = new Set<string>();
@@ -176,6 +207,7 @@ function start(): void {
   const toggled = new Set<string>();
   /** What the list is showing, to tell a change of view from a refresh. */
   let shownKey: string | null = null;
+  let toastTimerId: number | undefined;
   let ui: Ui | null = null;
 
   // ---- data capture -------------------------------------------------------
@@ -212,10 +244,21 @@ function start(): void {
       if (kind === 'profile') {
         const profile = json.Response as ProfileResponse;
         if (!profile.characterLoadouts) return;
+        const previousAnalysis = state.analysis;
         state.analysis = core.analyze(profile);
+        // The first check has nothing to compare with, so it never raises an alert.
+        let freshClashes: NewClash[] = [];
+        if (previousAnalysis) {
+          freshClashes = core.findNewClashes(previousAnalysis, state.analysis);
+          state.newClashes.push(...freshClashes);
+        }
         state.debug = core.debugSnapshot(profile);
         state.updatedAt = new Date();
         render();
+        if (freshClashes.length > 0) {
+          // Wait for the perk and loadout names, so the popup does not show raw ids.
+          void ensureNames().then(() => showToast(freshClashes));
+        }
       } else {
         const byLang = (json.Response as ManifestResponse).jsonWorldComponentContentPaths;
         if (!byLang) return;
@@ -443,14 +486,39 @@ function start(): void {
     pill.type = 'button';
     pill.setAttribute('aria-expanded', 'false');
     const label = el('span', undefined, 'Artifact check');
+    // Screen readers announce the text when a new clash replaces it.
+    label.setAttribute('aria-live', 'polite');
     pill.append(el('span', 'dot'), label);
 
-    shadow.append(panel, pill);
+    const toast = el('div', 'toast');
+    toast.hidden = true;
+    // Reading takes time: the popup stays while the mouse or keyboard focus is on it.
+    toast.addEventListener('mouseenter', () => window.clearTimeout(toastTimerId));
+    toast.addEventListener('mouseleave', startToastTimer);
+    toast.addEventListener('focusin', () => window.clearTimeout(toastTimerId));
+    toast.addEventListener('focusout', startToastTimer);
+    toast.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') hideToast();
+    });
+
+    shadow.append(panel, pill, toast);
 
     const setOpen = (open: boolean) => {
+      // The panel shows the same information, so the popup is not needed any more.
+      if (open) hideToast();
+      const firstNewClash = state.newClashes[0];
+      if (open && firstNewClash) {
+        // Open on the class that has the new clash.
+        state.tab = firstNewClash.characterId;
+      }
+      if (!open) {
+        // Closing the panel counts as having seen the alert.
+        state.newClashes = [];
+      }
       state.open = open;
       panel.hidden = !open;
       pill.setAttribute('aria-expanded', String(open));
+      render();
     };
     pill.addEventListener('click', () => setOpen(!state.open));
     close.addEventListener('click', () => {
@@ -466,7 +534,7 @@ function start(): void {
     });
 
     document.body.appendChild(host);
-    ui = { host, pill, label, tabs, filters, help, body, footText, exportButton };
+    ui = { host, pill, label, tabs, filters, help, toast, setOpen, body, footText, exportButton };
     render();
   }
 
@@ -493,6 +561,11 @@ function start(): void {
       } else {
         text = 'No artifact loadouts';
       }
+    }
+    // A new clash takes over the pill until the panel is opened.
+    if (state.newClashes.length > 0 && !state.open) {
+      status = 'clash';
+      text = describeNewClashesShort();
     }
     ui.pill.className = `pill ${status}`;
     ui.label.textContent = text;
@@ -561,6 +634,7 @@ function start(): void {
       }
 
       if (ui.tabs.hidden) body.append(el('div', 'char', CLASS_NAMES[character.classType] ?? 'Character'));
+      if (state.newClashes.length > 0) body.append(renderNewClashBanner());
       if (active === 'all' || active === 'clash') {
         for (const plan of character.plans) body.append(renderPlan(character.characterId, plan));
       }
@@ -628,6 +702,105 @@ function start(): void {
       ui?.tabs.querySelector<HTMLElement>('[aria-selected="true"]')?.focus();
     });
     return tab;
+  }
+
+  // ---- new clash alert ----------------------------------------------------
+
+  /** Short text for the pill, for example "New clash: slot 3 and slot 11". */
+  function describeNewClashesShort(): string {
+    const firstNewClash = state.newClashes[0];
+    if (state.newClashes.length === 1 && firstNewClash) {
+      return `New clash: slot ${firstNewClash.firstSlotIndex + 1} and slot ${firstNewClash.secondSlotIndex + 1}`;
+    }
+    return `${state.newClashes.length} new clashes`;
+  }
+
+  function startToastTimer(): void {
+    window.clearTimeout(toastTimerId);
+    toastTimerId = window.setTimeout(hideToast, TOAST_VISIBLE_MILLISECONDS);
+  }
+
+  function hideToast(): void {
+    window.clearTimeout(toastTimerId);
+    if (ui) ui.toast.hidden = true;
+  }
+
+  /** Shows a popup in the top right corner, where DIM shows its own notices. */
+  function showToast(freshClashes: NewClash[]): void {
+    // While the panel is open it already shows these clashes at the top.
+    if (!ui || state.open) return;
+    const toast = ui.toast;
+    toast.textContent = '';
+
+    const title =
+      freshClashes.length === 1 ? 'New artifact clash' : `${freshClashes.length} new artifact clashes`;
+    const closeButton = el('button', 'icon', '×');
+    closeButton.type = 'button';
+    closeButton.setAttribute('aria-label', 'Dismiss');
+    closeButton.addEventListener('click', hideToast);
+    const header = el('div', 'toast-head');
+    header.append(el('span', 'toast-title', title), closeButton);
+    toast.append(header);
+
+    for (const freshClash of freshClashes.slice(0, MAX_CLASHES_IN_TOAST)) {
+      const className = CLASS_NAMES[freshClash.classType] ?? 'Character';
+      const firstSlotName = slotLabel(freshClash.firstSlotIndex, freshClash.firstSlotNameHash);
+      const secondSlotName = slotLabel(freshClash.secondSlotIndex, freshClash.secondSlotNameHash);
+      const perkNames = freshClash.perkHashes.map((perkHash) => perkName(perkHash)).join(', ');
+      toast.append(
+        el('div', 'toast-line', `${className}: ${firstSlotName} and ${secondSlotName}`),
+        el('div', 'toast-line muted', perkNames),
+      );
+    }
+    const hiddenClashCount = freshClashes.length - MAX_CLASHES_IN_TOAST;
+    if (hiddenClashCount > 0) toast.append(el('div', 'toast-line muted', `and ${hiddenClashCount} more`));
+
+    const openPanelButton = el('button', 'back', 'Open panel');
+    openPanelButton.type = 'button';
+    openPanelButton.addEventListener('click', () => ui?.setOpen(true));
+    const actions = el('div', 'toast-actions');
+    actions.append(openPanelButton);
+    toast.append(actions);
+
+    toast.hidden = false;
+    startToastTimer();
+  }
+
+  /** A box at the top of the panel listing the clashes that appeared since the last look. */
+  function renderNewClashBanner(): HTMLElement {
+    const banner = el('div', 'card alert');
+
+    const header = el('div', 'alert-header');
+    const title =
+      state.newClashes.length === 1
+        ? 'New clash since the last refresh'
+        : `${state.newClashes.length} new clashes since the last refresh`;
+    const dismissButton = el('button', 'back', 'Dismiss');
+    dismissButton.type = 'button';
+    dismissButton.addEventListener('click', () => {
+      state.newClashes = [];
+      render();
+    });
+    header.append(el('span', 'card-title', title), dismissButton);
+
+    const content = el('div', 'card-body');
+    for (const newClash of state.newClashes) {
+      const className = CLASS_NAMES[newClash.classType] ?? 'Character';
+      const firstSlotName = slotLabel(newClash.firstSlotIndex, newClash.firstSlotNameHash);
+      const secondSlotName = slotLabel(newClash.secondSlotIndex, newClash.secondSlotNameHash);
+      const perkNames = newClash.perkHashes.map((perkHash) => perkName(perkHash)).join(', ');
+
+      const step = el('div', 'step');
+      step.append(
+        el('div', 'step-title', `${className}: ${firstSlotName} and ${secondSlotName}`),
+        el('div', undefined, `They keep these perks in different positions: ${perkNames}.`),
+      );
+      content.append(step);
+    }
+    content.append(el('p', 'note', 'Saving a build over a slot can cause this. See "Suggested fix" below.'));
+
+    banner.append(header, content);
+    return banner;
   }
 
   // ---- suggested fix ------------------------------------------------------

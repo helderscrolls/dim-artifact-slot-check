@@ -15,6 +15,7 @@
     analyze: () => analyze,
     debugItemHashes: () => debugItemHashes,
     debugSnapshot: () => debugSnapshot,
+    findNewClashes: () => findNewClashes,
     layoutFrom: () => layoutFrom,
     neededHashes: () => neededHashes,
     summarize: () => summarize
@@ -342,6 +343,43 @@
     }));
     return { artifacts, characters };
   }
+  function makeSlotPairKey(characterId, slotIndexA, slotIndexB) {
+    const lowerSlotIndex = Math.min(slotIndexA, slotIndexB);
+    const higherSlotIndex = Math.max(slotIndexA, slotIndexB);
+    return `${characterId}:${lowerSlotIndex}:${higherSlotIndex}`;
+  }
+  function findNewClashes(previousAnalysis, currentAnalysis) {
+    const previousPairKeys = /* @__PURE__ */ new Set();
+    for (const character of previousAnalysis.characters) {
+      for (const slot of character.slots) {
+        for (const clash of slot.clashes) {
+          previousPairKeys.add(makeSlotPairKey(character.characterId, slot.index, clash.otherIndex));
+        }
+      }
+    }
+    const newClashes = [];
+    const reportedPairKeys = /* @__PURE__ */ new Set();
+    for (const character of currentAnalysis.characters) {
+      for (const slot of character.slots) {
+        for (const clash of slot.clashes) {
+          const pairKey = makeSlotPairKey(character.characterId, slot.index, clash.otherIndex);
+          if (previousPairKeys.has(pairKey) || reportedPairKeys.has(pairKey)) continue;
+          reportedPairKeys.add(pairKey);
+          const thisSlotComesFirst = slot.index < clash.otherIndex;
+          newClashes.push({
+            characterId: character.characterId,
+            classType: character.classType,
+            firstSlotIndex: thisSlotComesFirst ? slot.index : clash.otherIndex,
+            firstSlotNameHash: thisSlotComesFirst ? slot.nameHash : clash.otherNameHash,
+            secondSlotIndex: thisSlotComesFirst ? clash.otherIndex : slot.index,
+            secondSlotNameHash: thisSlotComesFirst ? clash.otherNameHash : slot.nameHash,
+            perkHashes: clash.perks.map((clashPerk) => clashPerk.perkHash)
+          });
+        }
+      }
+    }
+    return newClashes;
+  }
   function debugItemHashes(snapshot) {
     const hashes = /* @__PURE__ */ new Set();
     for (const artifact of snapshot.artifacts) {
@@ -382,6 +420,8 @@
   var CACHE_KEY = "dim-artifact-slot-check:names:v1";
   var CLASS_NAMES = { 0: "Titan", 1: "Hunter", 2: "Warlock" };
   var LOG_TAG = "[Artifact Slot Check]";
+  var TOAST_VISIBLE_MILLISECONDS = 1e4;
+  var MAX_CLASHES_IN_TOAST = 3;
   var CSS = `
 :host{all:initial;position:fixed;left:16px;bottom:16px;z-index:2147483000;
   font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#e8e9f0}
@@ -440,6 +480,9 @@ div.row{padding-left:26px}
 
 .card{margin-bottom:8px;border-radius:8px;border:1px solid #35507a;background:#1f2738}
 .card.warn{border-color:#6b5a2a;background:#2a2619}
+.card.alert{border-color:#7a3a38;background:#2f1d1f}
+.card.alert .card-title{color:#ff9d94}
+.alert-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px}
 .card>summary{display:flex;align-items:baseline;gap:8px;padding:9px 11px;cursor:pointer;list-style:none}
 .card>summary::-webkit-details-marker{display:none}
 .card>summary::before{content:"\u25B8";color:#a5a8be;font-size:10px;width:8px;flex:none}
@@ -465,6 +508,16 @@ li{margin:2px 0}
 .back{border:1px solid #3a3d52;background:none;color:#d3d5e3;font-size:12px;padding:3px 10px;border-radius:5px;cursor:pointer}
 .back:hover{background:#2e3145}
 
+.toast{position:fixed;top:16px;right:16px;width:min(340px,calc(100vw - 32px));padding:11px 14px 12px;
+  border-radius:10px;border:1px solid #7a3a38;background:#2a1b1d;box-shadow:0 10px 32px rgba(0,0,0,.6);
+  animation:toast-in .18s ease-out}
+@keyframes toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.toast{animation:none}}
+.toast-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.toast-title{font-weight:700;color:#ff9d94}
+.toast-line{margin-top:3px;font-size:12px;color:#e3e4ee}
+.toast-line.muted{color:#a5a8be}
+.toast-actions{margin-top:10px}
 .foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 14px;
   border-top:1px solid #2e3145;color:#a5a8be;font-size:11px}
 .export{flex:none;border:1px solid #3a3d52;background:none;color:#d3d5e3;font-size:11px;
@@ -483,7 +536,8 @@ li{margin:2px 0}
       debug: null,
       tab: null,
       filter: "all",
-      view: "main"
+      view: "main",
+      newClashes: []
     };
     const names = readCache();
     const notFound = /* @__PURE__ */ new Set();
@@ -491,6 +545,7 @@ li{margin:2px 0}
     let namesJob = Promise.resolve();
     const toggled = /* @__PURE__ */ new Set();
     let shownKey = null;
+    let toastTimerId;
     let ui = null;
     window.fetch = function(...args) {
       const promise = origFetch.apply(this, args);
@@ -514,10 +569,19 @@ li{margin:2px 0}
         if (kind === "profile") {
           const profile = json.Response;
           if (!profile.characterLoadouts) return;
+          const previousAnalysis = state.analysis;
           state.analysis = analyze(profile);
+          let freshClashes = [];
+          if (previousAnalysis) {
+            freshClashes = findNewClashes(previousAnalysis, state.analysis);
+            state.newClashes.push(...freshClashes);
+          }
           state.debug = debugSnapshot(profile);
           state.updatedAt = /* @__PURE__ */ new Date();
           render();
+          if (freshClashes.length > 0) {
+            void ensureNames().then(() => showToast(freshClashes));
+          }
         } else {
           const byLang = json.Response.jsonWorldComponentContentPaths;
           if (!byLang) return;
@@ -704,12 +768,31 @@ li{margin:2px 0}
       pill.type = "button";
       pill.setAttribute("aria-expanded", "false");
       const label = el("span", void 0, "Artifact check");
+      label.setAttribute("aria-live", "polite");
       pill.append(el("span", "dot"), label);
-      shadow.append(panel, pill);
+      const toast = el("div", "toast");
+      toast.hidden = true;
+      toast.addEventListener("mouseenter", () => window.clearTimeout(toastTimerId));
+      toast.addEventListener("mouseleave", startToastTimer);
+      toast.addEventListener("focusin", () => window.clearTimeout(toastTimerId));
+      toast.addEventListener("focusout", startToastTimer);
+      toast.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") hideToast();
+      });
+      shadow.append(panel, pill, toast);
       const setOpen = (open) => {
+        if (open) hideToast();
+        const firstNewClash = state.newClashes[0];
+        if (open && firstNewClash) {
+          state.tab = firstNewClash.characterId;
+        }
+        if (!open) {
+          state.newClashes = [];
+        }
         state.open = open;
         panel.hidden = !open;
         pill.setAttribute("aria-expanded", String(open));
+        render();
       };
       pill.addEventListener("click", () => setOpen(!state.open));
       close.addEventListener("click", () => {
@@ -724,7 +807,7 @@ li{margin:2px 0}
         }
       });
       document.body.appendChild(host);
-      ui = { host, pill, label, tabs, filters, help, body, footText, exportButton };
+      ui = { host, pill, label, tabs, filters, help, toast, setOpen, body, footText, exportButton };
       render();
     }
     function render() {
@@ -746,6 +829,10 @@ li{margin:2px 0}
         } else {
           text = "No artifact loadouts";
         }
+      }
+      if (state.newClashes.length > 0 && !state.open) {
+        status = "clash";
+        text = describeNewClashesShort();
       }
       ui.pill.className = `pill ${status}`;
       ui.label.textContent = text;
@@ -799,6 +886,7 @@ li{margin:2px 0}
           ui.filters.append(chip);
         }
         if (ui.tabs.hidden) body.append(el("div", "char", CLASS_NAMES[character.classType] ?? "Character"));
+        if (state.newClashes.length > 0) body.append(renderNewClashBanner());
         if (active === "all" || active === "clash") {
           for (const plan of character.plans) body.append(renderPlan(character.characterId, plan));
         }
@@ -850,6 +938,82 @@ li{margin:2px 0}
         ui?.tabs.querySelector('[aria-selected="true"]')?.focus();
       });
       return tab;
+    }
+    function describeNewClashesShort() {
+      const firstNewClash = state.newClashes[0];
+      if (state.newClashes.length === 1 && firstNewClash) {
+        return `New clash: slot ${firstNewClash.firstSlotIndex + 1} and slot ${firstNewClash.secondSlotIndex + 1}`;
+      }
+      return `${state.newClashes.length} new clashes`;
+    }
+    function startToastTimer() {
+      window.clearTimeout(toastTimerId);
+      toastTimerId = window.setTimeout(hideToast, TOAST_VISIBLE_MILLISECONDS);
+    }
+    function hideToast() {
+      window.clearTimeout(toastTimerId);
+      if (ui) ui.toast.hidden = true;
+    }
+    function showToast(freshClashes) {
+      if (!ui || state.open) return;
+      const toast = ui.toast;
+      toast.textContent = "";
+      const title = freshClashes.length === 1 ? "New artifact clash" : `${freshClashes.length} new artifact clashes`;
+      const closeButton = el("button", "icon", "\xD7");
+      closeButton.type = "button";
+      closeButton.setAttribute("aria-label", "Dismiss");
+      closeButton.addEventListener("click", hideToast);
+      const header = el("div", "toast-head");
+      header.append(el("span", "toast-title", title), closeButton);
+      toast.append(header);
+      for (const freshClash of freshClashes.slice(0, MAX_CLASHES_IN_TOAST)) {
+        const className = CLASS_NAMES[freshClash.classType] ?? "Character";
+        const firstSlotName = slotLabel(freshClash.firstSlotIndex, freshClash.firstSlotNameHash);
+        const secondSlotName = slotLabel(freshClash.secondSlotIndex, freshClash.secondSlotNameHash);
+        const perkNames = freshClash.perkHashes.map((perkHash) => perkName(perkHash)).join(", ");
+        toast.append(
+          el("div", "toast-line", `${className}: ${firstSlotName} and ${secondSlotName}`),
+          el("div", "toast-line muted", perkNames)
+        );
+      }
+      const hiddenClashCount = freshClashes.length - MAX_CLASHES_IN_TOAST;
+      if (hiddenClashCount > 0) toast.append(el("div", "toast-line muted", `and ${hiddenClashCount} more`));
+      const openPanelButton = el("button", "back", "Open panel");
+      openPanelButton.type = "button";
+      openPanelButton.addEventListener("click", () => ui?.setOpen(true));
+      const actions = el("div", "toast-actions");
+      actions.append(openPanelButton);
+      toast.append(actions);
+      toast.hidden = false;
+      startToastTimer();
+    }
+    function renderNewClashBanner() {
+      const banner = el("div", "card alert");
+      const header = el("div", "alert-header");
+      const title = state.newClashes.length === 1 ? "New clash since the last refresh" : `${state.newClashes.length} new clashes since the last refresh`;
+      const dismissButton = el("button", "back", "Dismiss");
+      dismissButton.type = "button";
+      dismissButton.addEventListener("click", () => {
+        state.newClashes = [];
+        render();
+      });
+      header.append(el("span", "card-title", title), dismissButton);
+      const content = el("div", "card-body");
+      for (const newClash of state.newClashes) {
+        const className = CLASS_NAMES[newClash.classType] ?? "Character";
+        const firstSlotName = slotLabel(newClash.firstSlotIndex, newClash.firstSlotNameHash);
+        const secondSlotName = slotLabel(newClash.secondSlotIndex, newClash.secondSlotNameHash);
+        const perkNames = newClash.perkHashes.map((perkHash) => perkName(perkHash)).join(", ");
+        const step = el("div", "step");
+        step.append(
+          el("div", "step-title", `${className}: ${firstSlotName} and ${secondSlotName}`),
+          el("div", void 0, `They keep these perks in different positions: ${perkNames}.`)
+        );
+        content.append(step);
+      }
+      content.append(el("p", "note", 'Saving a build over a slot can cause this. See "Suggested fix" below.'));
+      banner.append(header, content);
+      return banner;
     }
     function renderPlan(characterId, plan) {
       const box = foldable("card", `plan:${characterId}:${plan.artifactHash}`, true);

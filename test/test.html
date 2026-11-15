@@ -8,6 +8,10 @@
 <body>
 <h1>Artifact Slot Check test page</h1>
 <p>Made-up data. The panel in the bottom-left corner is the extension UI.</p>
+<p>
+  <button id="resave-button" type="button">Simulate re-saving a Hunter slot</button>
+  <span style="color:#8d90a8">Raises the "new clash" alert. Reload the page to reset.</span>
+</p>
 <pre id="out"></pre>
 <script src="fixture.js"></script>
 <script src="../dist/inject.js"></script>
@@ -41,6 +45,19 @@
 
   check('layoutFrom skips a single Empty Artifact Mod', Array.from(core.layoutFrom([5, 1235188590, 7])), [[5, 0], [7, 2]]);
 
+  // Saving a second build onto the hunter's artifact, with two perks swapped.
+  var hunterResavedSlot = { colorHash: 1, iconHash: 1, nameHash: 12, items: [
+    { itemInstanceId: 'W1', plugItemHashes: [1, 2, 2, 3] },
+    { itemInstanceId: 'A2', plugItemHashes: [101, 102, 103, P.shuttle, P.harvest, 106, 107, 999] }] };
+  var changedProfile = JSON.parse(JSON.stringify(FIXTURE.profile));
+  changedProfile.characterLoadouts.data.C2.loadouts[1] = hunterResavedSlot;
+  var changedAnalysis = core.analyze(changedProfile);
+  var newClashes = core.findNewClashes(a, changedAnalysis);
+  check('a re-saved slot raises exactly one new clash', newClashes.length, 1);
+  check('the new clash names the slots and perks', [newClashes[0].classType, newClashes[0].firstSlotIndex, newClashes[0].secondSlotIndex, newClashes[0].perkHashes.sort()], [1, 0, 1, [P.harvest, P.shuttle]]);
+  check('no new clash when nothing changed', core.findNewClashes(a, core.analyze(FIXTURE.profile)).length, 0);
+  check('a clash that went away is not reported', core.findNewClashes(changedAnalysis, a).length, 0);
+
   var plan = warlock.plans[0];
   check('one plan, for the clashing artifact', [warlock.plans.length, hunter.plans.length], [1, 0]);
   check('plan re-saves one slot and drops none', [plan.changes.map(function (c) { return c.index; }), plan.excluded.length, plan.exhaustive], [[1], 0, true]);
@@ -53,6 +70,15 @@
   // Drive the page script the way DIM would: Request objects through fetch.
   fetch(new Request('https://www.bungie.net/Platform/Destiny2/Manifest/'));
   fetch(new Request('https://www.bungie.net/Platform/Destiny2/3/Profile/123/?components=100,206'));
+
+  // A second refresh after the hunter re-saves a slot, as DIM would do after the player saves a build.
+  window.simulateResave = function () {
+    FIXTURE.profile.characterLoadouts.data.C2.loadouts[1] = hunterResavedSlot;
+    return fetch(new Request('https://www.bungie.net/Platform/Destiny2/3/Profile/123/?components=100,206'));
+  };
+  document.getElementById('resave-button').addEventListener('click', function () {
+    window.simulateResave();
+  });
 })();
 </script>
 </body>
